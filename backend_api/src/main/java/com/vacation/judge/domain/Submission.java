@@ -33,6 +33,10 @@ public class Submission {
     @Column(columnDefinition = "TEXT")
     private String resultOutput;
 
+    @Setter
+    @Column(columnDefinition = "TEXT")
+    private String testCasesJson;
+
     public Submission(User user, String problemText, String code, String language) {
         this.user = user;
         this.problemText = problemText;

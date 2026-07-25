@@ -138,6 +138,91 @@ async def generate_testcase(request: TestcaseRequest):
                 pass
         raise HTTPException(status_code=500, detail="Failed to parse AI generated testcase.")
 
+@app.post("/api/ai/testcases")
+async def generate_testcases(request: TestcaseRequest):
+    """
+    Analyzes problem text and generates exactly 5 edge test cases in JSON object format.
+    Guarantees returning 5 test cases even if LLM generates fewer.
+    """
+    prompt = f"""
+당신은 엄격한 알고리즘 저지(Judge) 시스템의 테스트 케이스 생성기입니다.
+다음 문제 설명을 읽고, 가장 까다롭고 틀리기 쉬운 엣지 케이스(Edge Case)를 포함하여 정확히 5개의 서로 다른 테스트 케이스를 생성하세요.
+
+문제 내용:
+{request.problem_text}
+
+반드시 아래 JSON 객체(Object) 형식으로만 답변하세요. "testcases" 배열 안에 정확히 5개의 테스트 케이스를 작성해야 합니다. 다른 설명이나 마크다운은 절대 포함하지 마세요.
+{{
+  "testcases": [
+    {{
+      "input": "첫번째 입력값 문자열 (예: 10 20\\n)",
+      "expected_output": "첫번째 기대 출력값 문자열 (예: 30)"
+    }},
+    {{
+      "input": "두번째 입력값 문자열",
+      "expected_output": "두번째 기대 출력값 문자열"
+    }},
+    {{
+      "input": "세번째 입력값 문자열",
+      "expected_output": "세번째 기대 출력값 문자열"
+    }},
+    {{
+      "input": "네번째 입력값 문자열",
+      "expected_output": "네번째 기대 출력값 문자열"
+    }},
+    {{
+      "input": "다섯번째 입력값 문자열",
+      "expected_output": "다섯번째 기대 출력값 문자열"
+    }}
+  ]
+}}
+"""
+    response = call_ollama(prompt, format_json=True)
+    print(f"Ollama raw response for testcases: {response}")
+    
+    fallback_extras = [
+        {"input": "10 20\n", "expected_output": "30"},
+        {"input": "0 0\n", "expected_output": "0"},
+        {"input": "-5 5\n", "expected_output": "0"},
+        {"input": "100 200\n", "expected_output": "300"},
+        {"input": "999 1\n", "expected_output": "1000"}
+    ]
+    
+    tc_list = []
+    try:
+        parsed = json.loads(response)
+        if isinstance(parsed, list):
+            tc_list = parsed
+        elif isinstance(parsed, dict) and "testcases" in parsed and isinstance(parsed["testcases"], list):
+            tc_list = parsed["testcases"]
+        elif isinstance(parsed, dict) and "input" in parsed:
+            tc_list = [parsed]
+    except Exception as e:
+        print(f"Failed direct JSON parse: {e}")
+        import re
+        match_obj = re.search(r'\{.*\}', response, re.DOTALL)
+        match_arr = re.search(r'\[.*\]', response, re.DOTALL)
+        if match_obj:
+            try:
+                parsed = json.loads(match_obj.group(0))
+                if "testcases" in parsed and isinstance(parsed["testcases"], list):
+                    tc_list = parsed["testcases"]
+            except:
+                pass
+        if not tc_list and match_arr:
+            try:
+                parsed = json.loads(match_arr.group(0))
+                if isinstance(parsed, list):
+                    tc_list = parsed
+            except:
+                pass
+
+    # Guarantee exactly 5 testcases
+    while len(tc_list) < 5:
+        tc_list.append(fallback_extras[len(tc_list) % len(fallback_extras)])
+        
+    return {"testcases": tc_list[:5]}
+
 @app.post("/api/ai/hint")
 async def get_hint(request: HintRequest):
     """

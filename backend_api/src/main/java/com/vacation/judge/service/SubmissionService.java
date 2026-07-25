@@ -55,36 +55,32 @@ public class SubmissionService implements MessageListener {
                 .orElseThrow(() -> new IllegalArgumentException("User not found"));
 
         Submission submission = new Submission(user, requestDto.getProblemText(), requestDto.getCode(), requestDto.getLanguage());
-        submissionRepository.save(submission);
 
-        // Call AI Server to generate testcase
-        String aiInput = "10 10\n";
-        String aiExpected = "20";
-        try {
-            org.springframework.web.client.RestTemplate restTemplate = new org.springframework.web.client.RestTemplate();
-            Map<String, String> aiRequest = Map.of("problem_text", requestDto.getProblemText());
-            JsonNode response = restTemplate.postForObject(aiServerUrl + "/testcase", aiRequest, JsonNode.class);
-            if (response != null && response.has("input") && response.has("expected_output")) {
-                aiInput = response.get("input").asText();
-                aiExpected = response.get("expected_output").asText();
-                if (!aiInput.endsWith("\n")) aiInput += "\n";
-                log.info("AI generated testcase: input={}, expected={}", aiInput, aiExpected);
-            }
-        } catch (Exception e) {
-            log.error("Failed to generate testcase from AI server, using fallback", e);
+        java.util.List<com.vacation.judge.dto.TestCaseDto> testCases = requestDto.getTestCases();
+        if (testCases == null || testCases.isEmpty()) {
+            testCases = java.util.List.of(new com.vacation.judge.dto.TestCaseDto("10 10\n", "20"));
         }
+        try {
+            submission.setTestCasesJson(objectMapper.writeValueAsString(testCases));
+        } catch (Exception e) {
+            log.error("Failed to serialize testCases", e);
+        }
+        submissionRepository.save(submission);
+        String firstInput = testCases.get(0).getInput();
+        String firstExpected = testCases.get(0).getExpectedOutput();
 
         SubmissionMessageDto messageDto = new SubmissionMessageDto(
                 submission.getId(),
                 submission.getCode(),
                 submission.getLanguage(),
-                aiInput,
-                aiExpected,
-                2
+                firstInput,
+                firstExpected,
+                2,
+                testCases
         );
 
         rabbitTemplate.convertAndSend(RabbitMQConfig.QUEUE_NAME, messageDto);
-        log.info("Published submission {} to RabbitMQ", submission.getId());
+        log.info("Published submission {} with {} testcases to RabbitMQ", submission.getId(), testCases.size());
 
         return submission.getId();
     }
@@ -133,23 +129,30 @@ public class SubmissionService implements MessageListener {
             JsonNode jsonNode = objectMapper.readTree(body);
 
             Long submissionId = jsonNode.get("submission_id").asLong();
-            String status = jsonNode.get("status").asText();
-            String output = jsonNode.get("output").asText();
+            String type = jsonNode.has("type") ? jsonNode.get("type").asText() : "SUBMISSION_COMPLETE";
 
-            // Update DB
-            submissionRepository.findById(submissionId).ifPresent(submission -> {
-                submission.setStatus(status);
-                submission.setResultOutput(output);
-                submissionRepository.save(submission);
-            });
-
-            // Notify SSE
             SseEmitter emitter = emitters.get(submissionId);
-            if (emitter != null) {
-                emitter.send(SseEmitter.event().name("judge_result").data(body));
-                emitter.complete();
-            }
 
+            if ("TESTCASE_RESULT".equals(type)) {
+                if (emitter != null) {
+                    emitter.send(SseEmitter.event().name("testcase_result").data(body));
+                }
+            } else {
+                String status = jsonNode.has("status") ? jsonNode.get("status").asText() : "FAIL";
+                String output = jsonNode.has("output") ? jsonNode.get("output").asText() : "";
+
+                // Update DB
+                submissionRepository.findById(submissionId).ifPresent(submission -> {
+                    submission.setStatus(status);
+                    submission.setResultOutput(output);
+                    submissionRepository.save(submission);
+                });
+
+                if (emitter != null) {
+                    emitter.send(SseEmitter.event().name("judge_result").data(body));
+                    emitter.complete();
+                }
+            }
         } catch (Exception e) {
             log.error("Error processing redis message", e);
         }

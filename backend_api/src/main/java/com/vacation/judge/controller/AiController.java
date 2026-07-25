@@ -57,4 +57,20 @@ public class AiController {
             return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
         }
     }
+
+    @PostMapping("/testcases")
+    public ResponseEntity<?> generateTestcases(@RequestBody Map<String, String> request) {
+        try {
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            
+            HttpEntity<Map<String, String>> entity = new HttpEntity<>(request, headers);
+            String aiServerUrl = aiServerBaseUrl + "/testcases";
+            
+            ResponseEntity<Map> response = restTemplate.postForEntity(aiServerUrl, entity, Map.class);
+            return ResponseEntity.ok(response.getBody());
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
+    }
 }

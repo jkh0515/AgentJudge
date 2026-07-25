@@ -1,6 +1,9 @@
 package com.vacation.judge.controller;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.vacation.judge.domain.Problem;
 import com.vacation.judge.domain.Submission;
+import com.vacation.judge.repository.ProblemRepository;
 import com.vacation.judge.repository.SubmissionRepository;
 import com.vacation.judge.security.CustomUserDetails;
 import lombok.RequiredArgsConstructor;
@@ -21,6 +24,8 @@ import java.util.HashMap;
 public class UserController {
 
     private final SubmissionRepository submissionRepository;
+    private final ProblemRepository problemRepository;
+    private final ObjectMapper objectMapper;
 
     @GetMapping("/me")
     public ResponseEntity<?> getMyProfile(Authentication authentication) {
@@ -68,14 +73,44 @@ public class UserController {
         Long userId = userDetails.getUser().getId();
         
         List<Submission> submissions = submissionRepository.findByUserIdOrderByIdDesc(userId);
-        if (submissions.isEmpty()) {
-            return ResponseEntity.ok(Map.of("problemText", "", "code", "import sys\ndata = sys.stdin.read().strip().split()\nprint(int(data[0]) + int(data[1]))"));
+        List<Problem> problems = problemRepository.findAllByUserIdOrderByIdDesc(userId);
+        
+        String problemText = "";
+        String code = "import sys\ndata = sys.stdin.read().strip().split()\nprint(int(data[0]) + int(data[1]))";
+        Object testCases = null;
+        
+        if (!submissions.isEmpty()) {
+            Submission latest = submissions.get(0);
+            problemText = latest.getProblemText();
+            code = latest.getCode();
+            if (latest.getTestCasesJson() != null && !latest.getTestCasesJson().trim().isEmpty()) {
+                try {
+                    testCases = objectMapper.readValue(latest.getTestCasesJson(), Object.class);
+                } catch (Exception e) {
+                    // ignore
+                }
+            }
         }
         
-        Submission latest = submissions.get(0);
-        return ResponseEntity.ok(Map.of(
-            "problemText", latest.getProblemText(),
-            "code", latest.getCode()
-        ));
+        if (testCases == null && !problems.isEmpty()) {
+            Problem latestProb = problems.get(0);
+            if (problemText.isEmpty()) problemText = latestProb.getDescription() != null ? latestProb.getDescription() : "";
+            if (code.equals("import sys\ndata = sys.stdin.read().strip().split()\nprint(int(data[0]) + int(data[1]))") && latestProb.getCode() != null && !latestProb.getCode().trim().isEmpty()) {
+                code = latestProb.getCode();
+            }
+            if (latestProb.getTestCases() != null) {
+                testCases = latestProb.getTestCases().stream()
+                        .map(tc -> Map.of("input", tc.getInputData() != null ? tc.getInputData() : "", "expected_output", tc.getExpectedOutput() != null ? tc.getExpectedOutput() : "", "status", "PENDING"))
+                        .collect(Collectors.toList());
+            }
+        }
+        
+        Map<String, Object> response = new HashMap<>();
+        response.put("problemText", problemText);
+        response.put("code", code);
+        if (testCases != null) {
+            response.put("testCases", testCases);
+        }
+        return ResponseEntity.ok(response);
     }
 }

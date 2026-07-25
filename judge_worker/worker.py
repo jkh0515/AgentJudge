@@ -4,6 +4,7 @@ import docker
 import pika
 import redis
 import os
+import concurrent.futures
 
 # Initialize Docker client
 try:
@@ -102,18 +103,74 @@ def callback(ch, method, properties, body):
         submission_id = data.get("submission_id")
         code = data.get("code")
         language = data.get("language", "python")
-        input_data = data.get("input_data", "")
-        expected_output = data.get("expected_output", "")
         timeout = data.get("timeout", 2)
+        test_cases = data.get("testCases")
         
-        # Run judge logic synchronously
-        result = run_judge(submission_id, code, language, input_data, expected_output, timeout)
+        if not test_cases or not isinstance(test_cases, list):
+            test_cases = [{
+                "input": data.get("input_data", ""),
+                "expected_output": data.get("expected_output", "")
+            }]
+
+        print(f"Starting parallel judge for submission {submission_id} with {len(test_cases)} test cases.")
+
+        results = []
+        overall_status = "SUCCESS"
+        total_start_time = time.time()
+
+        def judge_single_tc(idx_tc_pair):
+            idx, tc = idx_tc_pair
+            inp = tc.get("input", "")
+            exp = tc.get("expected_output", tc.get("expectedOutput", ""))
+            res = run_judge(submission_id, code, language, inp, exp, timeout)
+            res["index"] = idx
+            
+            tc_result_event = {
+                "submission_id": submission_id,
+                "type": "TESTCASE_RESULT",
+                "index": idx,
+                "total": len(test_cases),
+                "status": res["status"],
+                "output": res["output"],
+                "exec_time": res["exec_time"],
+                "input": inp,
+                "expected_output": exp
+            }
+            redis_client.publish('judge_events', json.dumps(tc_result_event))
+            print(f"Published TESTCASE_RESULT #{idx} for submission {submission_id}: status={res['status']}")
+            return res
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(test_cases), 5)) as executor:
+            future_to_idx = {executor.submit(judge_single_tc, (idx, tc)): idx for idx, tc in enumerate(test_cases, 1)}
+            for future in concurrent.futures.as_completed(future_to_idx):
+                res = future.result()
+                results.append(res)
+                if res["status"] != "SUCCESS":
+                    if res["status"] in ["ERROR", "system_error"]:
+                        overall_status = "ERROR"
+                    elif res["status"] == "timeout" and overall_status != "ERROR":
+                        overall_status = "TIMEOUT"
+                    elif overall_status not in ["ERROR", "TIMEOUT"]:
+                        overall_status = "FAIL"
+
+        total_exec_time = round(time.time() - total_start_time, 3)
+
+        summary_lines = [f"--- All {len(test_cases)} Test Cases Completed in {total_exec_time}s ---"]
+        for idx, res in enumerate(sorted(results, key=lambda r: r.get("index", 0)), 1):
+            summary_lines.append(f"[TC #{idx}] Status: {res['status']} ({res['exec_time']}s)")
+            if res['status'] != "SUCCESS":
+                summary_lines.append(f"   Output: {res['output'].strip()}")
+
+        final_result = {
+            "submission_id": submission_id,
+            "type": "SUBMISSION_COMPLETE",
+            "status": overall_status,
+            "output": "\n".join(summary_lines),
+            "total_exec_time": total_exec_time
+        }
+        redis_client.publish('judge_events', json.dumps(final_result))
+        print(f"Published SUBMISSION_COMPLETE for submission {submission_id}: overall={overall_status}")
         
-        # Publish result to Redis
-        redis_client.publish('judge_events', json.dumps(result))
-        print(f"Published result to Redis: {result}")
-        
-        # Acknowledge the message
         ch.basic_ack(delivery_tag=method.delivery_tag)
     except Exception as e:
         print(f"Error processing message: {e}")

@@ -1,21 +1,21 @@
 package com.vacation.judge.dto;
 
+import java.util.List;
 import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
-import java.util.List;
 
 @Getter
 @Setter
 @NoArgsConstructor
 @AllArgsConstructor
-public class SubmissionMessageDto {
-    private Long submission_id;
+public class ProblemDto {
+    private Long id;
+    private String title;
+    private String description;
     private String code;
-    private String language;
-    private String input_data;
-    private String expected_output;
-    private int timeout;
+    private int timeLimitMs;
+    private int memoryLimitMb;
     private List<TestCaseDto> testCases;
 }
