@@ -34,16 +34,22 @@ def run_judge(submission_id: int, code: str, language: str, input_data: str = ""
         return {"status": "error", "message": "Only python is supported in Phase 3."}
 
     start_time = time.time()
+    internal_exec_time = None
+    memory_kb = 0
     
     wrapper_script = (
-        "import os, sys, subprocess\n"
+        "import os, sys, subprocess, time, resource\n"
         "with open('main.py', 'w', encoding='utf-8') as f:\n"
         "    f.write(os.environ.get('CODE', ''))\n"
         "with open('input.txt', 'w', encoding='utf-8') as f:\n"
         "    f.write(os.environ.get('INPUT_DATA', ''))\n"
+        "start = time.time()\n"
         "res = subprocess.run(['python', 'main.py'], stdin=open('input.txt', 'r'), capture_output=True, text=True)\n"
+        "exec_time = time.time() - start\n"
+        "ru = resource.getrusage(resource.RUSAGE_CHILDREN)\n"
         "sys.stdout.write(res.stdout)\n"
         "sys.stderr.write(res.stderr)\n"
+        "sys.stderr.write(f'\\n[EXEC_STATS]: {exec_time:.3f} {ru.ru_maxrss}\\n')\n"
         "sys.exit(res.returncode)\n"
     )
     
@@ -63,7 +69,20 @@ def run_judge(submission_id: int, code: str, language: str, input_data: str = ""
             result = container.wait(timeout=timeout)
             exit_code = result['StatusCode']
             stdout = container.logs(stdout=True, stderr=False).decode('utf-8')
-            stderr = container.logs(stdout=False, stderr=True).decode('utf-8')
+            stderr_full = container.logs(stdout=False, stderr=True).decode('utf-8')
+            
+            stderr_lines = []
+            for line in stderr_full.splitlines():
+                if line.startswith("[EXEC_STATS]:"):
+                    parts = line.split(":")[-1].strip().split()
+                    try:
+                        internal_exec_time = float(parts[0])
+                        memory_kb = int(parts[1])
+                    except:
+                        pass
+                elif line.strip() != "":
+                    stderr_lines.append(line)
+            stderr = "\n".join(stderr_lines)
             
             if exit_code != 0:
                 status = "ERROR"
@@ -89,11 +108,13 @@ def run_judge(submission_id: int, code: str, language: str, input_data: str = ""
         exit_code = -1
 
     exec_time = time.time() - start_time
+    final_exec_time = internal_exec_time if internal_exec_time is not None else round(exec_time, 3)
     return {
         "submission_id": submission_id,
         "status": status,
         "output": output,
-        "exec_time": round(exec_time, 3),
+        "exec_time": final_exec_time,
+        "memory_kb": memory_kb,
         "exit_code": exit_code
     }
 
@@ -133,6 +154,7 @@ def callback(ch, method, properties, body):
                 "status": res["status"],
                 "output": res["output"],
                 "exec_time": res["exec_time"],
+                "memory_kb": res.get("memory_kb", 0),
                 "input": inp,
                 "expected_output": exp
             }
@@ -157,7 +179,7 @@ def callback(ch, method, properties, body):
 
         summary_lines = [f"--- All {len(test_cases)} Test Cases Completed in {total_exec_time}s ---"]
         for idx, res in enumerate(sorted(results, key=lambda r: r.get("index", 0)), 1):
-            summary_lines.append(f"[TC #{idx}] Status: {res['status']} ({res['exec_time']}s)")
+            summary_lines.append(f"[TC #{idx}] Status: {res['status']} ({res['exec_time']}s / {res.get('memory_kb', 0)}KB)")
             if res['status'] != "SUCCESS":
                 summary_lines.append(f"   Output: {res['output'].strip()}")
 

@@ -11,6 +11,7 @@ interface TestCase {
   status?: 'PENDING' | 'RUNNING' | 'SUCCESS' | 'FAIL' | 'ERROR' | 'TIMEOUT';
   output?: string;
   exec_time?: number;
+  memory_kb?: number;
 }
 
 export default function JudgePage() {
@@ -314,7 +315,8 @@ export default function JudgePage() {
               ...tc,
               status: result.status === 'SUCCESS' ? 'SUCCESS' : 'FAIL',
               output: result.output,
-              exec_time: result.exec_time
+              exec_time: result.exec_time,
+              memory_kb: result.memory_kb
             };
           }
           return tc;
@@ -543,12 +545,12 @@ export default function JudgePage() {
                     <div className="flex items-center gap-2">
                       {tc.status === 'SUCCESS' && (
                         <span className="px-2 py-0.5 rounded-full bg-green-500/20 text-green-400 text-xs flex items-center gap-1 font-medium">
-                          <CheckCircle className="w-3 h-3" /> 통과 ({tc.exec_time}s)
+                          <CheckCircle className="w-3 h-3" /> 통과 ({tc.exec_time}s / {tc.memory_kb}KB)
                         </span>
                       )}
                       {tc.status === 'FAIL' && (
                         <span className="px-2 py-0.5 rounded-full bg-red-500/20 text-red-400 text-xs flex items-center gap-1 font-medium">
-                          <XCircle className="w-3 h-3" /> 실패 ({tc.exec_time}s)
+                          <XCircle className="w-3 h-3" /> 실패 ({tc.exec_time}s / {tc.memory_kb}KB)
                         </span>
                       )}
                       {tc.status === 'RUNNING' && (
