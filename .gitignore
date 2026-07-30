@@ -6,14 +6,18 @@
 venv/
 env/
 
+# AI (dataset, models)
+ai_model
+ai_model/*
+dataset
+dataset/*
+
 # Python (Backend & Worker)
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-dataset/*
-dataset
 build/
 develop-eggs/
 dist/

@@ -65,7 +65,8 @@ public class AiController {
             headers.setContentType(MediaType.APPLICATION_JSON);
             
             HttpEntity<Map<String, String>> entity = new HttpEntity<>(request, headers);
-            String aiServerUrl = aiServerBaseUrl + "/testcases";
+            // AI 서버의 최신 Multi-Agent (Self-Healing) 엔드포인트로 라우팅
+            String aiServerUrl = aiServerBaseUrl + "/edge-cases";
             
             ResponseEntity<Map> response = restTemplate.postForEntity(aiServerUrl, entity, Map.class);
             return ResponseEntity.ok(response.getBody());

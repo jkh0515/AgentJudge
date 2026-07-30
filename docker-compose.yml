@@ -21,9 +21,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - OLLAMA_URL=http://ollama:11434/api/generate
-    depends_on:
-      - ollama
+      - OLLAMA_URL=http://host.docker.internal:11434/api/generate
     restart: unless-stopped
 
   redis:

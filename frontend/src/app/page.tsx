@@ -218,7 +218,12 @@ export default function JudgePage() {
           expected_output: tc.expected_output || tc.expectedOutput || "",
           status: 'PENDING'
         })));
-        setOutput(prev => prev + `[🤖 AI] 엣지 테스트케이스 ${data.testcases.length}개 생성 완료!\n`);
+        let successMsg = `[🤖 AI] 엣지 테스트케이스 ${data.testcases.length}개 생성 완료!\n`;
+        if (data.solution_code) {
+          setCode(data.solution_code);
+          successMsg += `[🤖 AI] 자가 치유(Self-Healing)를 통과한 최적화 정답 코드가 에디터에 적용되었습니다!\n`;
+        }
+        setOutput(prev => prev + successMsg);
       }
     } catch (error: any) {
       setOutput(prev => prev + `[🤖 AI Error] ${error.message}\n`);
