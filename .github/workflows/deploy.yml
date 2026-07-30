@@ -47,6 +47,19 @@ jobs:
           script: |
             cd ~/judge-app
             git pull origin main
+            
+            # Ensure Docker Compose v2 is installed globally to prevent ContainerConfig errors
+            if ! docker compose version > /dev/null 2>&1; then
+              echo "Docker Compose v2 not found. Installing globally..."
+              sudo mkdir -p /usr/local/lib/docker/cli-plugins
+              sudo curl -SL https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-x86_64 -o /usr/local/lib/docker/cli-plugins/docker-compose
+              sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+            fi
+            
+            # Force remove old containers to clear corrupted states
+            docker compose -f docker-compose.prod.yml down || true
             docker rm -f judge_backend judge_worker || true
-            docker-compose -f docker-compose.prod.yml pull
-            docker-compose -f docker-compose.prod.yml up -d
+            
+            # Deploy using bulletproof v2
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d
