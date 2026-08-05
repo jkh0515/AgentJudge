@@ -198,7 +198,8 @@ export default function JudgePage() {
     setActiveTab('testcases');
     setOutput(prev => prev + '\n[🤖 AI] 문제 분석 및 엣지 테스트케이스 5개 생성 중...\n');
     try {
-      const response = await fetch(`/api/ai/testcases`, {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
+      const response = await fetch(`${apiUrl}/api/ai/testcases`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -210,7 +211,24 @@ export default function JudgePage() {
       });
 
       const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "테스트케이스 생성 실패");
+      
+      let logsMsg = "";
+      if (data && data.judge_logs && data.judge_logs.length > 0) {
+        logsMsg += `\n=== 🔎 [AI 멀티-에이전트 심판 로그] ===\n`;
+        data.judge_logs.forEach((log: any) => {
+          logsMsg += `[Attempt ${log.attempt} - ${log.case_name}]\n`;
+          logsMsg += `👉 판결: ${log.fault === 'NONE' ? '✅ 패스' : `❌ ${log.fault} 잘못`}\n`;
+          logsMsg += `👉 사유: ${log.reason}\n\n`;
+        });
+        logsMsg += `====================================\n\n`;
+      }
+      
+      if (!response.ok || data.error) {
+        setOutput(prev => prev + logsMsg + `[🤖 AI Error] ${data.error || "테스트케이스 생성 실패"}\n`);
+        alert("AI 엣지 케이스 생성 실패: " + (data.error || "서버 오류"));
+        setIsGeneratingTc(false);
+        return;
+      }
 
       if (data && data.testcases && Array.isArray(data.testcases)) {
         setTestCases(data.testcases.map((tc: any) => ({
@@ -218,16 +236,16 @@ export default function JudgePage() {
           expected_output: tc.expected_output || tc.expectedOutput || "",
           status: 'PENDING'
         })));
-        let successMsg = `[🤖 AI] 엣지 테스트케이스 ${data.testcases.length}개 생성 완료!\n`;
+        let successMsg = logsMsg + `[🤖 AI] 엣지 테스트케이스 ${data.testcases.length}개 생성 완료!\n`;
         if (data.solution_code) {
           setCode(data.solution_code);
-          successMsg += `[🤖 AI] 자가 치유(Self-Healing)를 통과한 최적화 정답 코드가 에디터에 적용되었습니다!\n`;
+          successMsg += `[🤖 AI] 자가 치유(Self-Healing) 및 최종 검증을 통과한 최적화 정답 코드가 에디터에 적용되었습니다!\n`;
         }
         setOutput(prev => prev + successMsg);
       }
     } catch (error: any) {
       setOutput(prev => prev + `[🤖 AI Error] ${error.message}\n`);
-      alert("AI 테스트케이스 생성에 실패했습니다: " + error.message);
+      alert("AI 엣지 케이스 생성에 실패했습니다: " + error.message);
     } finally {
       setIsGeneratingTc(false);
     }
