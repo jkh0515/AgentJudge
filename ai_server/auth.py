@@ -6,8 +6,10 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 security = HTTPBearer()
 
-# Default secret from Spring Boot (Base64 encoded string)
-JWT_SECRET_B64 = os.environ.get("JWT_SECRET", "VmFjYXRpb25KWRnZVNlY3JldEtleUZvckp3dEF1dGhlbnRpY2F0aW9uV2l0aFNwcmluZ1NlY3VyaXR5")
+# Require JWT_SECRET from environment variable
+JWT_SECRET_B64 = os.environ.get("JWT_SECRET")
+if not JWT_SECRET_B64:
+    raise RuntimeError("JWT_SECRET environment variable is not set!")
 
 try:
     # Add padding if necessary

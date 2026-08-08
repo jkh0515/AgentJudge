@@ -40,7 +40,7 @@ server:
   port: 8080
 
 jwt:
-  secret: ${JWT_SECRET:VmFjYXRpb25KWRnZVNlY3JldEtleUZvckp3dEF1dGhlbnRpY2F0aW9uV2l0aFNwcmluZ1NlY3VyaXR5}
+  secret: ${JWT_SECRET}
   expiration_time: 86400000 # 24 hours in ms
 
 app:

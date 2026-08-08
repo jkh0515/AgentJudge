@@ -23,6 +23,7 @@ services:
       - "8000:8000"
     environment:
       - OLLAMA_URL=http://host.docker.internal:11434/api/generate
+      - JWT_SECRET=${JWT_SECRET}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./ai_server:/app
