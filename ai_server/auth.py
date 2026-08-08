@@ -10,6 +10,7 @@ security = HTTPBearer()
 JWT_SECRET_B64 = os.environ.get("JWT_SECRET")
 if not JWT_SECRET_B64:
     raise RuntimeError("JWT_SECRET environment variable is not set!")
+JWT_SECRET_B64 = JWT_SECRET_B64.strip()
 
 try:
     # Add padding if necessary
@@ -27,8 +28,11 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Security(secu
         payload = jwt.decode(token, JWT_SECRET_BYTES, algorithms=["HS256", "HS384", "HS512"])
         return payload
     except jwt.ExpiredSignatureError:
+        print("Token expired error")
         raise HTTPException(status_code=401, detail="Token has expired")
     except jwt.InvalidTokenError as e:
+        print(f"Invalid token error: {str(e)}")
         raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
     except Exception as e:
+        print(f"Other token error: {str(e)}")
         raise HTTPException(status_code=401, detail="Unauthorized")
