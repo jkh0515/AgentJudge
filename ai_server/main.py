@@ -6,8 +6,47 @@ import subprocess
 import re
 import asyncio
 import httpx
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import cv2
+import numpy as np
+import ast
+
+def robust_parse_json(text: str):
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    clean_text = text.replace('```json', '').replace('```', '').strip()
+    start_arr, end_arr = clean_text.find('['), clean_text.rfind(']')
+    start_obj, end_obj = clean_text.find('{'), clean_text.rfind('}')
+    candidates = [clean_text]
+    if start_arr != -1 and end_arr != -1 and start_arr < end_arr:
+        candidates.append(clean_text[start_arr:end_arr+1])
+    if start_obj != -1 and end_obj != -1 and start_obj < end_obj:
+        candidates.append(clean_text[start_obj:end_obj+1])
+    for cand in candidates:
+        cand = cand.strip()
+        if not cand: continue
+        try:
+            return json.loads(cand)
+        except Exception:
+            pass
+        try:
+            no_trailing = re.sub(r',\s*([\]}])', r'\1', cand)
+            return json.loads(no_trailing)
+        except Exception:
+            pass
+        try:
+            python_str = cand.replace("true", "True").replace("false", "False").replace("null", "None")
+            res = ast.literal_eval(python_str)
+            if isinstance(res, (dict, list)):
+                return res
+        except Exception:
+            pass
+    raise ValueError("Failed to robustly parse JSON")
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from auth import verify_token
 from pydantic import BaseModel
 from paddleocr import PaddleOCR
 
@@ -41,8 +80,8 @@ class TestcaseRequest(BaseModel):
 class EdgeCaseRequest(BaseModel):
     problem_text: str
 
-def call_ollama(prompt: str, format_json: bool = False) -> str:
-    """Helper function to call local Ollama API."""
+async def call_ollama(client: httpx.AsyncClient, prompt: str, format_json: bool = False, temperature: float = None) -> str:
+    """Helper function to call local Ollama API asynchronously."""
     payload = {
         "model": MODEL_NAME,
         "prompt": prompt,
@@ -50,33 +89,48 @@ def call_ollama(prompt: str, format_json: bool = False) -> str:
     }
     if format_json:
         payload["format"] = "json"
+    if temperature is not None:
+        payload["options"] = {"temperature": temperature}
         
     try:
-        response = requests.post(OLLAMA_URL, json=payload)
+        response = await client.post(OLLAMA_URL, json=payload, timeout=60.0)
         response.raise_for_status()
         return response.json().get("response", "")
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         print(f"Ollama API Error: {e}")
         return "Error connecting to local AI model. Ensure Ollama is running."
 
-@app.post("/api/ai/process-problem")
-async def process_problem(file: UploadFile = File(...)):
+def process_image_sync(content: bytes, temp_path: str):
+    """CPU-bound image preprocessing for OCR."""
+    np_arr = np.frombuffer(content, np.uint8)
+    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if img is not None:
+        img = cv2.resize(img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        cv2.imencode('.png', gray)[1].tofile(temp_path)
+    else:
+        with open(temp_path, 'wb') as f:
+            f.write(content)
+
+@app.post("/api/ai/ocr", dependencies=[Depends(verify_token)])
+async def extract_and_refine_problem(file: UploadFile = File(...)):
     """
-    1. Runs OCR on uploaded image.
-    2. Uses Ollama to format the problem and generate 10 test cases.
+    1. Runs OCR on uploaded image (offloaded to thread).
+    2. Uses Ollama to format the problem as clean plain text.
     """
     if not file.content_type.startswith('image/'):
         raise HTTPException(status_code=400, detail="File must be an image.")
 
-    # Save image to temp file for PaddleOCR
     with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp_img:
-        content = await file.read()
-        temp_img.write(content)
         temp_img_path = temp_img.name
 
     try:
-        # 1. OCR Extraction
-        result = ocr.ocr(temp_img_path, cls=True)
+        content = await file.read()
+        # Offload CPU-heavy OpenCV processing
+        await asyncio.to_thread(process_image_sync, content, temp_img_path)
+        
+        # Offload CPU-heavy PaddleOCR execution
+        result = await asyncio.to_thread(ocr.ocr, temp_img_path)
         raw_text = ""
         if result and result[0]:
             for line in result[0]:
@@ -86,107 +140,137 @@ async def process_problem(file: UploadFile = File(...)):
         if not raw_text.strip():
             return {"error": "No text detected in the image."}
 
-        # 2. Problem Formatting & Test Case Generation via LLM
+        # 2. Problem Formatting via LLM
         prompt = f"""
-다음은 알고리즘 문제지 이미지를 OCR로 스캔한 거친 텍스트입니다.
-이 텍스트를 바탕으로 두 가지 작업을 수행해주세요:
+You are an expert algorithm problem writer. 
+I will give you a completely broken, corrupted OCR text of a programming problem.
+Your job is to COMPLETELY REWRITE it into a natural, perfect Korean algorithm problem.
 
-1. [문제 정보 정리] 제목, 문제 내용, 입력 조건, 출력 조건, 제한 사항을 깔끔한 마크다운으로 정리해주세요.
-2. [테스트 케이스 생성] 위 조건들을 만족하면서, 경계값(Edge Case)을 포함하여 가장 까다롭고 틀리기 쉬운 테스트 케이스 10개를 "입력"과 "기대 출력" 형태로 만들어주세요.
+You MUST wrap your final Korean text strictly inside <result> and </result> tags. DO NOT add any conversational preamble.
 
-**[주의: 반드시 한국어(Korean)로만 대답하세요. 절대 중국어나 영어를 사용하지 마세요.]**
+[RULES]
+1. COMPLETELY REWRITE: Do NOT try to preserve weird alien text (like '|o롬으릉', 'Yo言', '머우어0윙', '람RYPTO', 'Ioly울'). Completely throw them away and REWRITE the sentence so it makes logical sense in Korean.
+2. NATURAL FLOW: Ensure it reads perfectly smoothly as a standard Baekjoon or Programmers problem.
+3. PRESERVE LOGIC: You can change the wording to fix broken sentences, but do NOT alter the math rules, variable names (N, M, t), or numbers.
+4. LAYOUT FORMATTING: Add empty lines between paragraphs. ALWAYS add an empty line before sections like "문제", "입력", "출력", "예제 입력 1", "예제 출력 1".
+5. FREEZE EXAMPLES: The data under "예제 입력 1" and "예제 출력 1" MUST be kept absolutely identical to the raw text. Do not format it.
 
---- OCR 텍스트 ---
+<raw_text>
 {raw_text}
 """
-        llm_response = call_ollama(prompt)
+        max_retries = 7
+        llm_response = ""
+        final_text = ""
         
+        async with httpx.AsyncClient() as client:
+            for attempt in range(max_retries):
+                # Dynamic temperature scaling to avoid loop traps
+                temp = 0.2 + (attempt * 0.1)
+                llm_response = await call_ollama(client, prompt, temperature=temp)
+                
+                # Extract text inside <result> tags
+                match = re.search(r'<result>(.*?)</result>', llm_response, re.DOTALL)
+                if match:
+                    final_text = match.group(1).strip()
+                    if final_text:
+                        break
+                
+                # Fallback if they forgot tags but included # 문제 (common LLM behavior)
+                fallback_match = re.search(r'(#\s*문제.*)', llm_response, re.DOTALL | re.IGNORECASE)
+                if fallback_match:
+                    final_text = fallback_match.group(1).strip()
+                    # Clean up trailing conversational text if any
+                    final_text = re.sub(r'\n\n(위와 같이|여기 정제된|도움이 되셨나요|Here is|Hope this helps).*$', '', final_text, flags=re.DOTALL)
+                    if final_text:
+                        print(f"Agent: OCR Refiner used fallback regex to extract problem text.")
+                        break
+                
+                print(f"Agent: Invalid output or missing <result> tags in OCR Refiner (Attempt {attempt+1}/{max_retries}). Retrying with temp {temp}...")
+                print(f"RAW: {repr(llm_response)}")
+            else:
+                # Fallback if all retries fail
+                print("Agent: Failed to generate clean text. Applying raw text fallback.")
+                final_text = "[AI 정제 실패: 원본 텍스트를 반환합니다]\n\n" + raw_text
+
         return {
-            "raw_ocr_text": raw_text,
-            "ai_processed_result": llm_response
+            "raw_text": raw_text.strip(),
+            "refined_text": final_text
         }
 
     finally:
         if os.path.exists(temp_img_path):
             os.remove(temp_img_path)
 
-@app.post("/api/ai/testcase")
+@app.post("/api/ai/testcase", dependencies=[Depends(verify_token)])
 async def generate_testcase(request: TestcaseRequest):
     """
     Analyzes problem text and generates exactly 1 edge test case in JSON format.
     """
     prompt = f"""
-당신은 엄격한 알고리즘 저지(Judge) 시스템의 테스트 케이스 생성기입니다.
-다음 문제 설명을 읽고, 가장 까다로운 엣지 케이스(Edge Case) 1개를 생성하세요.
+You are an expert test case generator for a strict algorithm Judge system.
+Read the problem description below and generate exactly 1 challenging edge test case.
 
-문제 내용:
+Problem Description:
 {request.problem_text}
 
-반드시 아래 JSON 형식으로만 답변하세요. 다른 설명이나 마크다운은 절대 포함하지 마세요.
+You MUST answer ONLY in the following JSON format. NEVER include markdown or extra explanations. The values for "input" and "expected_output" must be strings.
 {{
-  "input": "여기에 입력값을 문자열로 작성",
-  "expected_output": "여기에 기대되는 출력값을 문자열로 작성"
+  "input": "Write the input string here",
+  "expected_output": "Write the expected output string here"
 }}
 """
-    response = call_ollama(prompt, format_json=True)
-    try:
-        # Validate that it is actually parsable JSON
-        parsed = json.loads(response)
-        return parsed
-    except json.JSONDecodeError:
-        # Fallback if the model didn't return perfect JSON
-        import re
-        match = re.search(r'\{.*\}', response, re.DOTALL)
-        if match:
+    max_retries = 5
+    async with httpx.AsyncClient() as client:
+        for attempt in range(max_retries):
+            response = await call_ollama(client, prompt, format_json=True)
             try:
-                parsed = json.loads(match.group(0))
+                parsed = robust_parse_json(response)
                 return parsed
-            except:
-                pass
-        raise HTTPException(status_code=500, detail="Failed to parse AI generated testcase.")
+            except Exception:
+                print(f"Agent: Failed to parse testcase (Attempt {attempt+1}/{max_retries}). Retrying...")
+    raise HTTPException(status_code=500, detail="Failed to parse AI generated testcase after retries.")
 
-@app.post("/api/ai/testcases")
+@app.post("/api/ai/testcases", dependencies=[Depends(verify_token)])
 async def generate_testcases(request: TestcaseRequest):
     """
     Analyzes problem text and generates exactly 5 edge test cases in JSON object format.
     Guarantees returning 5 test cases even if LLM generates fewer.
     """
     prompt = f"""
-당신은 엄격한 알고리즘 저지(Judge) 시스템의 테스트 케이스 생성기입니다.
-다음 문제 설명을 읽고, 가장 까다롭고 틀리기 쉬운 엣지 케이스(Edge Case)를 포함하여 정확히 5개의 서로 다른 테스트 케이스를 생성하세요.
+You are an expert test case generator for a strict algorithm Judge system.
+Read the problem description below and generate exactly 5 distinct test cases, including challenging and tricky edge cases.
 
-문제 내용:
+Problem Description:
 {request.problem_text}
 
-반드시 아래 JSON 객체(Object) 형식으로만 답변하세요. "testcases" 배열 안에 정확히 5개의 테스트 케이스를 작성해야 합니다. 다른 설명이나 마크다운은 절대 포함하지 마세요.
+You MUST answer ONLY in the following JSON Object format. You must provide exactly 5 test cases inside the "testcases" array. NEVER include markdown or extra explanations.
 {{
   "testcases": [
     {{
-      "input": "첫번째 입력값 문자열 (예: 10 20\\n)",
-      "expected_output": "첫번째 기대 출력값 문자열 (예: 30)"
+      "input": "first input string (e.g. 10 20\\n)",
+      "expected_output": "first expected output string (e.g. 30)"
     }},
     {{
-      "input": "두번째 입력값 문자열",
-      "expected_output": "두번째 기대 출력값 문자열"
+      "input": "second input string",
+      "expected_output": "second expected output string"
     }},
     {{
-      "input": "세번째 입력값 문자열",
-      "expected_output": "세번째 기대 출력값 문자열"
+      "input": "third input string",
+      "expected_output": "third expected output string"
     }},
     {{
-      "input": "네번째 입력값 문자열",
-      "expected_output": "네번째 기대 출력값 문자열"
+      "input": "fourth input string",
+      "expected_output": "fourth expected output string"
     }},
     {{
-      "input": "다섯번째 입력값 문자열",
-      "expected_output": "다섯번째 기대 출력값 문자열"
+      "input": "fifth input string",
+      "expected_output": "fifth expected output string"
     }}
   ]
 }}
 """
-    response = call_ollama(prompt, format_json=True)
-    print(f"Ollama raw response for testcases: {response}")
-    
+    max_retries = 5
+    tc_list = []
     fallback_extras = [
         {"input": "10 20\n", "expected_output": "30"},
         {"input": "0 0\n", "expected_output": "0"},
@@ -195,34 +279,23 @@ async def generate_testcases(request: TestcaseRequest):
         {"input": "999 1\n", "expected_output": "1000"}
     ]
     
-    tc_list = []
-    try:
-        parsed = json.loads(response)
-        if isinstance(parsed, list):
-            tc_list = parsed
-        elif isinstance(parsed, dict) and "testcases" in parsed and isinstance(parsed["testcases"], list):
-            tc_list = parsed["testcases"]
-        elif isinstance(parsed, dict) and "input" in parsed:
-            tc_list = [parsed]
-    except Exception as e:
-        print(f"Failed direct JSON parse: {e}")
-        import re
-        match_obj = re.search(r'\{.*\}', response, re.DOTALL)
-        match_arr = re.search(r'\[.*\]', response, re.DOTALL)
-        if match_obj:
+    async with httpx.AsyncClient() as client:
+        for attempt in range(max_retries):
+            response = await call_ollama(client, prompt, format_json=True)
+            print(f"Ollama raw response for testcases (Attempt {attempt+1}/{max_retries}): {response}")
             try:
-                parsed = json.loads(match_obj.group(0))
-                if "testcases" in parsed and isinstance(parsed["testcases"], list):
-                    tc_list = parsed["testcases"]
-            except:
-                pass
-        if not tc_list and match_arr:
-            try:
-                parsed = json.loads(match_arr.group(0))
+                parsed = robust_parse_json(response)
                 if isinstance(parsed, list):
                     tc_list = parsed
-            except:
-                pass
+                    break
+                elif isinstance(parsed, dict) and "testcases" in parsed and isinstance(parsed["testcases"], list):
+                    tc_list = parsed["testcases"]
+                    break
+                elif isinstance(parsed, dict) and "input" in parsed:
+                    tc_list = [parsed]
+                    break
+            except Exception as e:
+                print(f"Failed robust JSON parse (Attempt {attempt+1}/{max_retries}): {e}")
 
     # Guarantee exactly 5 testcases
     while len(tc_list) < 5:
@@ -230,48 +303,42 @@ async def generate_testcases(request: TestcaseRequest):
         
     return {"testcases": tc_list[:5]}
 
-@app.post("/api/ai/hint")
+@app.post("/api/ai/hint", dependencies=[Depends(verify_token)])
 async def get_hint(request: HintRequest):
     """
     Analyzes failed code and provides a hint based on time/space complexity.
     """
     prompt = f"""
-당신은 최고의 알고리즘 코딩 테스트 선생님입니다.
-학생이 아래 문제를 풀다가 코드가 틀렸거나 시간 초과가 발생했습니다.
-정답 코드를 절대 직접 알려주지 말고, 시간 복잡도와 공간 복잡도를 분석하여 어떤 논리적 오류가 있는지 핵심적인 '힌트'만 마크다운으로 제공해주세요.
+You are the best algorithm coding test tutor.
+The student's code below has either failed or timed out while solving the following problem.
+DO NOT provide the direct answer or full correct code. Analyze the time and space complexity, and provide ONLY the core logical 'hints' in markdown format.
 
-**[주의: 반드시 한국어(Korean)로만 대답하세요. 절대 중국어나 영어를 사용하지 마세요.]**
+**[WARNING: You MUST respond ONLY in Korean (한국어). NEVER use Chinese or English for the explanation.]**
 
---- 문제 정보 ---
+--- Problem ---
 {request.problem_text}
 
---- 학생의 틀린 코드 ---
+--- Student's Failed Code ---
 {request.failed_code}
 """
-    hint = call_ollama(prompt)
+    async with httpx.AsyncClient() as client:
+        hint = await call_ollama(client, prompt)
     return {"hint": hint}
 
 EDGE_CASE_SYSTEM_PROMPT = (
-    "You are an expert algorithm test case designer. Analyze the problem and generate CHALLENGING edge cases.\n"
-    "[STEP 1 - Read Constraints First]\n"
-    "Before generating any input, carefully read the Input section of the problem to understand:\n"
-    "  - What values N, C, or other variables can take (min/max bounds)\n"
-    "  - What the coordinates/values can be (e.g., 0 to 10^9, must be distinct, etc.)\n"
-    "  - Exactly how many lines/values the input must have\n"
-    "[STEP 2 - Generate VALID inputs]\n"
-    "1. The 'input' field must be the EXACT stdin string. Use \\n for newlines.\n"
-    "2. STRICTLY follow the constraints you read in Step 1. Do NOT exceed bounds or use forbidden values.\n"
-    "3. Token count must match EXACTLY: if first line is 'N C', then there must be exactly N more values.\n"
-    "   Example: N=3, C=2, houses=[1,5,9] -> input = '3 2\\n1\\n5\\n9' (exactly 5 tokens total)\n"
-    "4. Never use Chinese characters. Use only Korean for 'case_name' and 'reason'.\n"
-    "5. Target: max N, min N, greedy traps (clustered points), all same distance, extreme values.\n"
-    "6. Coordinates must all be DISTINCT (no duplicates).\n"
-    "[OUTPUT FORMAT] Respond ONLY with a valid JSON array:\n"
+    "당신은 알고리즘 채점 서버의 엣지 케이스 및 반례 설계 전문가입니다.\n"
+    "주어진 문제 설명과 정답 코드를 분석하여 치명적인 엣지 케이스(반례)를 생성하세요.\n"
+    "[생성 규칙 - 엄수!]\n"
+    "1. [가장 중요] 'generator_code' 항목에는 오직 파이썬으로 `eval()` 가능한 문자열 생성 코드(Python Expression) 또는 원시 문자열(Raw string)만 적으세요. 절대 설명글을 적지 마세요!\n"
+    "2. 반드시 100% 순수 한국어로만 작성하세요.\n"
+    "3. [제약 조건 엄수] 반례는 반드시 주어진 문제의 제약 조건(범위, 중복 허용 여부 등)과 입력 형식을 100% 지켜야 합니다. 조건을 위반하지 않는 선에서 최대값, 최소값, 극단적 상황, 특수 패턴 등 오답이나 시간 초과(TLE)를 유발할 수 있는 데이터를 포함하세요.\n"
+    "4. 'reason'(이유 설명)과 'case_name'은 무조건 100% 순수 한국어로 명확히 적으세요.\n"
+    "5. 반드시 다음과 같은 JSON 배열 구조로 응답해야 합니다:\n"
     "[\n"
     "  {\n"
-    "    \"case_name\": \"케이스 이름 (한국어)\",\n"
-    "    \"input\": \"실제 stdin 입력 문자열\",\n"
-    "    \"reason\": \"이 케이스를 선택한 이유 (한국어)\"\n"
+    "    \"case_name\": \"유형 이름\",\n"
+    "    \"generator_code\": \"파이썬 수식\",\n"
+    "    \"reason\": \"이유 설명\"\n"
     "  }\n"
     "]"
 )
@@ -281,36 +348,16 @@ async def call_coder_ai_async(client: httpx.AsyncClient, problem_text: str, erro
     
     if not error_feedback:
         system_prompt = (
-            "You are an expert competitive programmer. Solve the given algorithm problem by writing complete, working Python code.\n"
-            "[RULE 1] You MUST parse all input using: data = sys.stdin.read().split()\n"
-            "  - data[0], data[1], data[2]... are the whitespace-separated tokens in order\n"
-            "  - Do NOT use input() or sys.stdin.readline()\n"
-            "[RULE 2] Write the FULL algorithm. Do NOT leave placeholder comments.\n"
-            "[RULE 3] Output ONLY a single ```python ... ``` code block. No explanations.\n"
-            "[EXAMPLE FORMAT]\n"
-            "```python\n"
-            "import sys\n"
-            "def solve():\n"
-            "    data = sys.stdin.read().split()\n"
-            "    n, m = int(data[0]), int(data[1])\n"
-            "    arr = list(map(int, data[2:n+2]))\n"
-            "    # ... full algorithm here ...\n"
-            "    print(answer)\n"
-            "if __name__ == '__main__':\n"
-            "    solve()\n"
-            "```"
+            "당신은 알고리즘 전문가입니다. 주어진 문제의 제약 조건을 완벽하게 준수하여 최적의 알고리즘 답 코드를 생성하세요."
+            " 어떤 부가 설명도 없이 오직 ```python ... ``` 블록으로만 응답하세요. 빠른 출력을 위해 sys.stdin.read를 적극 활용하세요."
         )
         user_prompt = problem_text
     else:
         system_prompt = (
-            "You are an expert competitive programmer. Fix the previous buggy code by writing complete, correct Python code.\n"
-            "[RULE 1] You MUST parse all input using: data = sys.stdin.read().split()\n"
-            "  - data[0], data[1], data[2]... are the whitespace-separated tokens in order\n"
-            "  - Do NOT use input() under any circumstances\n"
-            "[RULE 2] Write the FULL algorithm. Do NOT leave placeholder comments.\n"
-            "[RULE 3] Output ONLY a single ```python ... ``` code block. No explanations."
+            "당신은 알고리즘 전문가입니다. 이전 코드에서 발생한 오류를 수정하여 완전하고 올바른 Python 코드를 작성하세요."
+            " 어떤 부가 설명도 없이 오직 ```python ... ``` 블록으로만 응답하세요. 빠른 출력을 위해 sys.stdin.read를 적극 활용하세요."
         )
-        user_prompt = f"[Previous Code]\n{previous_code}\n\n[Failed Input]\n{failed_input}\n\n[Error or Wrong Output Feedback]\n{error_feedback}\n\nFix all bugs and write a complete working Python solution."
+        user_prompt = f"[문제 설명]\n{problem_text}\n\n[이전 코드]\n{previous_code}\n\n[실패한 입력]\n{failed_input}\n\n[오류 또는 틀린 출력 피드백]\n{error_feedback}\n\n모든 버그를 수정하고 완전히 동작하는 Python 솔루션을 작성하세요."
 
     payload = {
         "model": "code-generator-ai",
@@ -320,7 +367,7 @@ async def call_coder_ai_async(client: httpx.AsyncClient, problem_text: str, erro
         ],
         "stream": False,
         "options": {
-            "num_ctx": 4096
+            "num_ctx": 16384
         }
     }
     
@@ -338,53 +385,56 @@ async def call_coder_ai_async(client: httpx.AsyncClient, problem_text: str, erro
         print(f"Coder AI Async Error: {e}")
         return ""
 
-def call_ollama_edge_case(problem_text: str) -> list:
+async def call_ollama_edge_case(client: httpx.AsyncClient, problem_text: str) -> list:
     chat_url = OLLAMA_URL.replace("/api/generate", "/api/chat")
     user_prompt = problem_text
     
-    max_retries = 5
+    max_retries = 10
     for attempt in range(max_retries):
+        temp = 0.2 + (attempt * 0.1)
         payload = {
             "model": "edge-case-ai",
             "messages": [
                 {"role": "system", "content": EDGE_CASE_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}
             ],
-            "stream": False
+            "stream": False,
+            "options": {"temperature": temp, "num_ctx": 8192}
         }
         
         try:
-            response = requests.post(chat_url, json=payload, timeout=60)
+            response = await client.post(chat_url, json=payload, timeout=60.0)
             response.raise_for_status()
             content = response.json().get("message", {}).get("content", "")
             
-            if re.search(r'[\u4e00-\u9fff]', content):
-                print(f"Edge Case Gen: Attempt {attempt+1} contained Chinese. Retrying...")
+            if re.search(r'[一-鿿]', content):
+                print(f"Edge Case Gen: Attempt {attempt+1} contained Chinese. Retrying with temp {temp}...")
                 continue
                 
-            clean_json = content.replace('```json', '').replace('```', '').strip()
-            start_idx = clean_json.find('[')
-            end_idx = clean_json.rfind(']')
-            if start_idx != -1 and end_idx != -1:
-                clean_json = clean_json[start_idx:end_idx+1]
-            
-            cases = json.loads(clean_json)
+            try:
+                cases = robust_parse_json(content)
+            except Exception:
+                print(f"Edge Case Gen Error: Could not parse JSON. Retrying with temp {temp}...")
+                continue
             
             # Normalize: support both old 'generator_code' and new 'input' field
             normalized = []
-            for case in cases:
-                if "input" in case:
-                    # New format: direct input string
-                    normalized.append(case)
-                elif "generator_code" in case:
-                    # Legacy format: try to eval the expression
-                    try:
-                        actual_input = eval(case["generator_code"])
-                        if isinstance(actual_input, str):
-                            case["input"] = actual_input
+            if isinstance(cases, dict):
+                cases = [cases]
+                
+            if isinstance(cases, list):
+                for case in cases:
+                    if isinstance(case, dict):
+                        if "input" in case:
                             normalized.append(case)
-                    except Exception as e:
-                        print(f"Legacy generator_code eval failed: {e}")
+                        elif "generator_code" in case:
+                            try:
+                                actual_input = eval(case["generator_code"])
+                                if isinstance(actual_input, str):
+                                    case["input"] = actual_input
+                                    normalized.append(case)
+                            except Exception as e:
+                                print(f"Legacy generator_code eval failed: {e}")
             
             if normalized:
                 return normalized
@@ -395,31 +445,32 @@ def call_ollama_edge_case(problem_text: str) -> list:
     return []
 
 JUDGE_SYSTEM_PROMPT = (
-    "당신은 공정한 알고리즘 판사(Judge AI)입니다. Tester AI(반례 생성기)가 만든 [입력값]을 3명의 Coder AI(코드 생성기)가 각각 작성한 파이썬 코드에 넣고 실행했습니다. 그 결과(출력값 또는 에러)는 아래와 같습니다.\n"
-    "누가 잘못했는지 판결하고, 올바른 정답이 무엇인지 확인하세요.\n"
-    "[핵심 전제]\n"
-    "Coder AI는 반드시 `import sys; data = sys.stdin.read().split()` 방식으로 입력을 파싱합니다.\n"
-    "이 방식은 줄바꿈(\\n)과 공백( )을 모두 구분자로 처리합니다.\n"
-    "따라서 '값들이 한 줄에 다 있다', '줄바꿈이 없다' 같은 형식 차이는 TESTER의 잘못이 아닙니다!\n"
-    "[판결 기준]\n"
-    "1. Tester AI의 잘못(TESTER): 입력값의 숫자 개수가 문제 조건과 다르거나, 값이 제약 범위를 벗어나거나, 파이썬 int로 변환 불가능한 값이 있는 경우만 해당. 줄바꿈/공백 형식 차이는 TESTER 잘못이 아님!\n"
-    "2. Coder AI의 잘못(CODER): 입력값이 정상인데(개수, 타입, 범위 모두 OK) 3명의 Coder AI들이 모두 틀린 오답을 냈거나 에러를 발생시킨 경우.\n"
-    "3. 정상(NONE): 입력값도 정상이고, Coder AI 중 최소 1명이 올바른 정답을 출력한 경우.\n"
-    "[형식 엄수]\n"
-    "반드시 아래 JSON 형식으로만 답변하세요. 다른 설명이나 마크다운은 절대 포함하지 마세요.\n"
+"You are a fair Algorithm Judge AI. You are reviewing the Execution Results of 3 Coder AIs who ran their Python code against the [Input] generated by a Tester AI.\n"
+    "Your job is to determine who is at fault and identify the correct expected output.\n"
+    "[CORE ASSUMPTION]\n"
+    "All Coder AIs MUST parse input using: `import sys; data = sys.stdin.read().split()`\n"
+    "This method treats both newlines (\\n) and spaces ( ) as delimiters.\n"
+    "Therefore, formatting differences like 'all values on one line' or 'no newlines' are NEVER the Tester's fault!\n"
+    "[JUDGMENT CRITERIA]\n"
+    "1. Tester AI fault (TESTER): Applies if the input violates constraints (count, bounds, types) OR if the input is LOGICALLY IMPOSSIBLE (e.g., mathematically contradictory constraints, or violating the fundamental timeline/physical rules of the problem). Formatting is NOT a fault.\n"
+    "2. Coder AI fault (CODER): Applies if the input is perfectly valid AND logically possible, but ALL 3 Coder AIs either produced incorrect outputs or threw errors.\n"
+    "3. Normal (NONE): The input is valid, and AT LEAST 1 Coder AI produced the correct expected output.\n"
+    "[STRICT FORMAT]\n"
+    "You MUST respond ONLY in the JSON format below. DO NOT include markdown.\n"
     "{\n"
     "  \"fault\": \"CODER\" | \"TESTER\" | \"NONE\",\n"
-    "  \"expected_output\": \"정답값 (fault가 NONE일 때만 기재, 나머지는 빈 문자열)\",\n"
-    "  \"reason\": \"판결 이유 설명 (한국어)\"\n"
+    "  \"logical_analysis\": \"입력값이 문제의 논리에 어긋나지 않는지, 에러의 진짜 원인이 누구에게 있는지 분석 (한국어)\",\n"
+    "  \"expected_output\": \"The correct output string (only required if fault is NONE, otherwise empty string)\",\n"
+    "  \"reason\": \"최종 판결 이유 (한국어)\"\n"
     "}"
 )
 
-def call_judge_ai(problem_text: str, test_input: str, outputs: list) -> dict:
+async def call_judge_ai(client: httpx.AsyncClient, problem_text: str, test_input: str, outputs: list) -> dict:
     chat_url = OLLAMA_URL.replace("/api/generate", "/api/chat")
-    user_prompt = f"[문제 설명]\n{problem_text}\n\n[Tester가 던진 입력값]\n{test_input}\n\n[Coder들의 실행 결과]\n"
+    user_prompt = f"[Problem Description]\n{problem_text}\n\n[Input value provided by Tester]\n{test_input}\n\n[Execution Results from Coders]\n"
     for i, out in enumerate(outputs):
         user_prompt += f"Coder {i+1}: {out}\n"
-    user_prompt += "\n위 내용을 분석하여 누구의 잘못인지, 그리고 올바른 정답이 무엇인지 판결해주세요."
+    user_prompt += "\nAnalyze the above results, determine who is at fault, and provide the correct expected output."
     
     payload = {
         "model": MODEL_NAME,
@@ -435,7 +486,7 @@ def call_judge_ai(problem_text: str, test_input: str, outputs: list) -> dict:
     }
     
     try:
-        response = requests.post(chat_url, json=payload, timeout=60)
+        response = await client.post(chat_url, json=payload, timeout=60.0)
         response.raise_for_status()
         content = response.json().get("message", {}).get("content", "")
         parsed = json.loads(content)
@@ -461,7 +512,7 @@ VERIFIER_SYSTEM_PROMPT = (
     "}"
 )
 
-def call_verifier_ai(problem_text: str, test_input: str, test_output: str) -> dict:
+async def call_verifier_ai(client: httpx.AsyncClient, problem_text: str, test_input: str, test_output: str) -> dict:
     chat_url = OLLAMA_URL.replace("/api/generate", "/api/chat")
     user_prompt = f"[문제 설명]\n{problem_text}\n\n[입력값]\n{test_input}\n\n[도출된 출력값]\n{test_output}\n\n위 출력값이 명백한 오답인지 검증해주세요."
     
@@ -479,7 +530,7 @@ def call_verifier_ai(problem_text: str, test_input: str, test_output: str) -> di
     }
     
     try:
-        response = requests.post(chat_url, json=payload, timeout=60)
+        response = await client.post(chat_url, json=payload, timeout=60.0)
         response.raise_for_status()
         content = response.json().get("message", {}).get("content", "")
         parsed = json.loads(content)
@@ -489,14 +540,7 @@ def call_verifier_ai(problem_text: str, test_input: str, test_output: str) -> di
         return {"is_correct": True, "reason": "Verifier AI failed, assuming true."}
 
 def parse_sample_cases(problem_text: str) -> list:
-    """
-    Extract sample input/output pairs from problem text.
-    Handles: '예제 입력', '예제 입력 1/2', 'Sample Input', 'Example Input' etc.
-    Returns list of {"input": str, "output": str} dicts.
-    """
     cases = []
-    
-    # Strategy 1: Multiple numbered samples (예제 입력 1 / 예제 출력 1)
     blocks = re.split(r'(?=예제\s*입력\s*\d+|Sample\s*Input\s*\d+)', problem_text, flags=re.IGNORECASE)
     for block in blocks:
         inp_m = re.search(r'(?:예제\s*입력|Sample\s*Input)\s*\d*\s*\n([\s\S]*?)(?:예제\s*출력|Sample\s*Output|Expected)', block, re.IGNORECASE)
@@ -507,10 +551,8 @@ def parse_sample_cases(problem_text: str) -> list:
             if inp and out:
                 cases.append({"input": inp, "output": out})
     
-    if cases:
-        return cases
+    if cases: return cases
     
-    # Strategy 2: Single sample (예제 입력 / 예제 출력)
     inp_m = re.search(r'(?:예제\s*입력|Sample\s*Input)[^\n]*\n([\s\S]*?)(?:예제\s*출력|Sample\s*Output)', problem_text, re.IGNORECASE)
     out_m = re.search(r'(?:예제\s*출력|Sample\s*Output)[^\n]*\n([\s\S]*?)(?:\n\n|$)', problem_text, re.IGNORECASE)
     if inp_m and out_m:
@@ -518,322 +560,273 @@ def parse_sample_cases(problem_text: str) -> list:
         out = out_m.group(1).strip()
         if inp and out:
             cases.append({"input": inp, "output": out})
-    
     return cases
 
 async def run_code_against_input(code: str, test_input: str) -> str:
-    """Run python code string with given stdin input. Returns stdout or 'ERROR: ...'."""
-    import tempfile, os
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as f:
-        f.write(code)
-        tmp_path = f.name
+    """Run python code securely using a transient Docker container (DooD)."""
+    import base64
+    
+    # Encode code and input to base64 to avoid any quoting/escaping issues
+    code_b64 = base64.b64encode(code.encode('utf-8')).decode('utf-8')
+    input_b64 = base64.b64encode(test_input.encode('utf-8')).decode('utf-8')
+    
+    wrapper_script = f"""
+import sys, io, base64
+sys.stdin = io.StringIO(base64.b64decode('{input_b64}').decode('utf-8'))
+exec(base64.b64decode('{code_b64}').decode('utf-8'), {{"__name__": "__main__", "sys": sys}})
+"""
+
     try:
         proc = await asyncio.create_subprocess_exec(
-            "python", tmp_path,
+            "docker", "run", "--rm", "-i",
+            "--network", "none",
+            "--memory", "128m",
+            "--cpus", "0.5",
+            "python:3.10-slim",
+            "python", "-",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
+        
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(input=test_input.encode()), timeout=5.0)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(input=wrapper_script.encode('utf-8')), timeout=5.0)
             if proc.returncode == 0:
-                return stdout.decode().strip()
+                return stdout.decode('utf-8').strip()
             else:
-                return f"ERROR: {stderr.decode().strip()[:200]}"
+                return f"ERROR: {stderr.decode('utf-8').strip()[:200]}"
         except asyncio.TimeoutError:
             proc.kill()
             return "ERROR: TimeoutError"
-    finally:
-        try:
-            os.remove(tmp_path)
-        except:
-            pass
+            
+    except Exception as e:
+        return f"ERROR: Sandbox execution failed: {e}"
 
-@app.post("/api/ai/edge-cases")
-async def generate_full_edge_cases(request: EdgeCaseRequest):
-    print("Agent: Requesting edge cases from Tester AI...")
-    ai_cases = call_ollama_edge_case(request.problem_text)
-    if not ai_cases:
-        return {"error": "Failed to generate valid JSON testcases."}
-
-    print("Agent: Requesting 3 different solutions from Coder AI concurrently...")
-    async with httpx.AsyncClient() as client:
-        tasks = [call_coder_ai_async(client, request.problem_text) for _ in range(3)]
-        solution_codes = await asyncio.gather(*tasks)
-    
-    solution_codes = [c for c in solution_codes if c]
-    if not solution_codes:
-        return {"error": "Failed to generate python code."}
-        
+async def pre_validate_samples(client: httpx.AsyncClient, request: EdgeCaseRequest, solution_codes: list) -> tuple:
     final_solution_code = solution_codes[0]
-    
-    # ===== STEP: Sample Case Pre-Validation & Self-Healing =====
     sample_cases = parse_sample_cases(request.problem_text)
-    if sample_cases:
-        print(f"Agent: Found {len(sample_cases)} sample case(s). Running pre-validation...")
-        sample_passed = False
-        
-        async with httpx.AsyncClient() as client:
-            # Phase 1: Self-heal up to 3 times
-            for sample_attempt in range(3):
-                failed_sample = None
-                for sc in sample_cases:
-                    result = await run_code_against_input(final_solution_code, sc["input"])
-                    expected = sc["output"].strip()
-                    if result.strip() != expected:
-                        failed_sample = sc
-                        print(f"Agent: [Sample FAIL] Expected='{expected}', Got='{result}'")
-                        break
-                
-                if failed_sample is None:
-                    print(f"Agent: All {len(sample_cases)} sample case(s) PASSED! Proceeding...")
-                    sample_passed = True
-                    break
-                
-                print(f"Agent: Sample self-healing attempt {sample_attempt+1}/3...")
-                error_feedback = (
-                    f"Sample case FAILED.\n"
-                    f"Input: {failed_sample['input']}\n"
-                    f"Expected output: {failed_sample['output'].strip()}\n"
-                    f"Actual output  : {result}\n"
-                    f"The binary search direction or logic is wrong. Fix the algorithm completely."
-                )
-                healed = await call_coder_ai_async(
-                    client, request.problem_text,
-                    error_feedback=error_feedback,
-                    previous_code=final_solution_code,
-                    failed_input=failed_sample["input"]
-                )
-                if healed:
-                    final_solution_code = healed
-            
-            # Phase 2: If still failing, generate completely fresh code (not self-heal)
-            if not sample_passed:
-                print("Agent: Self-healing failed. Generating fresh code from scratch...")
-                for fresh_attempt in range(3):
-                    fresh_tasks = [call_coder_ai_async(client, request.problem_text) for _ in range(3)]
-                    fresh_codes = await asyncio.gather(*fresh_tasks)
-                    fresh_codes = [c for c in fresh_codes if c]
-                    
-                    for fresh_code in fresh_codes:
-                        all_pass = True
-                        for sc in sample_cases:
-                            result = await run_code_against_input(fresh_code, sc["input"])
-                            if result.strip() != sc["output"].strip():
-                                all_pass = False
-                                break
-                        if all_pass:
-                            final_solution_code = fresh_code
-                            sample_passed = True
-                            print(f"Agent: Fresh code passed all samples! Proceeding...")
-                            break
-                    if sample_passed:
-                        break
-                    print(f"Agent: Fresh generation attempt {fresh_attempt+1}/3 failed.")
-            
-            if not sample_passed:
-                print("Agent: WARNING - Could not generate code that passes sample cases.")
-                return {"error": "Failed to generate code that passes the sample test cases after multiple attempts."}
-    else:
-        print("Agent: No sample cases found in problem text. Skipping pre-validation.")
-    # ===== END Sample Case Pre-Validation =====
-
     
+    if not sample_cases:
+        print("Agent: No sample cases found in problem text. Skipping pre-validation.")
+        return final_solution_code, True
+        
+    print(f"Agent: Found {len(sample_cases)} sample case(s). Running pre-validation...")
+    sample_passed = False
+    
+    for sample_attempt in range(3):
+        failed_sample = None
+        for sc in sample_cases:
+            result = await run_code_against_input(final_solution_code, sc["input"])
+            expected = sc["output"].strip()
+            if result.strip() != expected:
+                failed_sample = sc
+                print(f"Agent: [Sample FAIL] Expected='{expected}', Got='{result}'")
+                break
+        
+        if failed_sample is None:
+            print(f"Agent: All {len(sample_cases)} sample case(s) PASSED! Proceeding...")
+            sample_passed = True
+            break
+        
+        print(f"Agent: Sample self-healing attempt {sample_attempt+1}/3...")
+        error_feedback = (
+            f"Sample case FAILED.\n"
+            f"Input: {failed_sample['input']}\n"
+            f"Expected output: {failed_sample['output'].strip()}\n"
+            f"Actual output  : {result}\n"
+            f"The binary search direction or logic is wrong. Fix the algorithm completely."
+        )
+        healed = await call_coder_ai_async(
+            client, request.problem_text,
+            error_feedback=error_feedback,
+            previous_code=final_solution_code,
+            failed_input=failed_sample["input"]
+        )
+        if healed:
+            final_solution_code = healed
+            
+    if not sample_passed:
+        print("Agent: Self-healing failed. Generating fresh code from scratch...")
+        for fresh_attempt in range(3):
+            fresh_tasks = [call_coder_ai_async(client, request.problem_text) for _ in range(3)]
+            fresh_codes = await asyncio.gather(*fresh_tasks)
+            fresh_codes = [c for c in fresh_codes if c]
+            
+            for fresh_code in fresh_codes:
+                all_pass = True
+                for sc in sample_cases:
+                    result = await run_code_against_input(fresh_code, sc["input"])
+                    if result.strip() != sc["output"].strip():
+                        all_pass = False
+                        break
+                if all_pass:
+                    final_solution_code = fresh_code
+                    sample_passed = True
+                    print(f"Agent: Fresh code passed all samples! Proceeding...")
+                    break
+            if sample_passed:
+                break
+            print(f"Agent: Fresh generation attempt {fresh_attempt+1}/3 failed.")
+            
+    return final_solution_code, sample_passed
+
+async def run_coder_tester_loop(client: httpx.AsyncClient, request: EdgeCaseRequest, ai_cases: list, solution_codes: list) -> dict:
     max_agent_retries = 10
     final_testcases = []
     judge_logs = []
-    case_fail_counts = {}  # track per-case failures: case_name -> fail_count
-    blacklist_cases = set()  # permanently skipped cases
+    case_fail_counts = {}
+    blacklist_cases = set()
     
     for attempt in range(max_agent_retries):
         print(f"Agent Loop: Testing Coder's codes (Attempt {attempt+1}/{max_agent_retries})")
-        
-        temp_paths = []
-        for sc in solution_codes:
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as f:
-                f.write(sc)
-                temp_paths.append(f.name)
-                
         code_failed = False
         failed_error = ""
         failed_input = ""
         successful_cases = []
         surviving_code_indices = list(range(len(solution_codes)))
         
-        try:
-            for idx, case in enumerate(ai_cases):
-                case_name = case.get("case_name", f"Edge Case {idx+1}")
-                # Skip blacklisted cases
-                if case_name in blacklist_cases:
-                    print(f"Skipping blacklisted case: {case_name}")
-                    continue
+        for idx, case in enumerate(ai_cases):
+            case_name = case.get("case_name", f"Edge Case {idx+1}")
+            if case_name in blacklist_cases:
+                continue
+            
+            actual_input = case.get("input", "")
+            if not actual_input: continue
+            
+            actual_input = actual_input.strip()
+            if not actual_input: continue
+            
+            # (Removed hardcoded router validation here to support general problems)
+            
+            run_tasks = [run_code_against_input(solution_codes[i], actual_input) for i in surviving_code_indices]
+            outputs = await asyncio.gather(*run_tasks)
+            
+            error_types = []
+            for o in outputs:
+                if "IndexError" in o or "list index out of range" in o: error_types.append("IndexError")
+                elif "ValueError" in o: error_types.append("ValueError")
+                elif "NameError" in o: error_types.append("NameError")
                 
-                # New format: 'input' field is the direct input string
-                actual_input = case.get("input", "")
-                if not actual_input:
-                    continue
-                
-                # --- Input sanity check: skip obviously malformed inputs ---
-                actual_input = actual_input.strip()
-                tokens = actual_input.split()
-                if len(tokens) < 4:
-                    print(f"Tester input too short ({len(tokens)} tokens), skipping case: {case.get('case_name')}")
-                    continue
-                try:
-                    n_val = int(tokens[0])
-                    c_val = int(tokens[1])
-                    if n_val <= 0 or c_val <= 0 or c_val > n_val:
-                        print(f"Tester input violates constraints (N={n_val}, C={c_val}), skipping.")
-                        continue
-                    # Require EXACTLY N+2 tokens (N, C, and exactly N coords)
-                    if len(tokens) != n_val + 2:
-                        print(f"Tester input wrong token count: need {n_val+2}, got {len(tokens)}, skipping.")
-                        continue
-                    # All coordinate tokens must be integers
-                    coords = [int(t) for t in tokens[2:]]
-                    # Check for duplicates
-                    if len(set(coords)) != len(coords):
-                        print(f"Tester input has duplicate coordinates, skipping.")
-                        continue
-                except (ValueError, IndexError):
-                    print(f"Tester input has non-integer tokens, skipping.")
-                    continue
-                
-                async def run_code(path):
-                    try:
-                        proc = await asyncio.create_subprocess_exec(
-                            "python", path,
-                            stdin=asyncio.subprocess.PIPE,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE
-                        )
-                        try:
-                            stdout, stderr = await asyncio.wait_for(proc.communicate(input=actual_input.encode()), timeout=5.0)
-                            if proc.returncode == 0:
-                                return stdout.decode().strip()
-                            else:
-                                return f"ERROR: {stderr.decode().strip()}"
-                        except asyncio.TimeoutError:
-                            proc.kill()
-                            return "ERROR: TimeoutExpired: The code took longer than 5.0 seconds."
-                    except Exception as e:
-                        return f"ERROR: {str(e)}"
-                
-                run_tasks = [run_code(path) for path in temp_paths]
-                outputs = await asyncio.gather(*run_tasks)
-                
-                # Auto-detect Tester fault: if ALL coders get same error type
-                error_types = []
-                for o in outputs:
-                    if "IndexError" in o or "list index out of range" in o:
-                        error_types.append("IndexError")
-                    elif "ValueError" in o:
-                        error_types.append("ValueError")
-                    elif "NameError" in o:
-                        error_types.append("NameError")
-                if len(error_types) == len(outputs) and len(set(error_types)) == 1:
-                    err_type = error_types[0]
-                    case_name = case.get("case_name", f"Edge Case {idx+1}")
-                    case_fail_counts[case_name] = case_fail_counts.get(case_name, 0) + 1
-                    print(f"All coders got {err_type} ({case_fail_counts[case_name]} times) - case: {case_name}")
-                    if case_fail_counts[case_name] >= 3:
-                        print(f"Case '{case_name}' failed 3+ times - blacklisting and skipping permanently.")
-                        blacklist_cases.add(case_name)
-                    judge_logs.append({
-                        "attempt": attempt + 1,
-                        "case_name": case_name,
-                        "fault": "TESTER",
-                        "reason": f"자동 감지: 모든 Coder가 {err_type} 발생 ({case_fail_counts[case_name]}회). 케이스를 스킵합니다."
-                    })
-                    continue
-                
-                valid_outputs = [o for o in outputs if not o.startswith("ERROR:")]
-                unique_outputs = list(set(valid_outputs))
-                
-                if not valid_outputs or len(unique_outputs) > 1:
-                    print(f"Agent: Errors or divergence detected. Calling Judge AI...")
-                    judge_result = call_judge_ai(request.problem_text, actual_input, outputs)
-                    
-                    judge_logs.append({
-                        "attempt": attempt + 1,
-                        "case_name": case.get("case_name", f"Edge Case {idx+1}"),
-                        "fault": judge_result.get("fault", "CODER"),
-                        "reason": judge_result.get("reason", "")
-                    })
-                    
-                    if judge_result.get("fault") == "TESTER":
-                        # Bad test case from Tester - just skip it, don't fail coders
-                        print(f"Judge AI ruled TESTER fault: {judge_result.get('reason')}")
-                        continue
-                    elif judge_result.get("fault") == "CODER":
-                        # Count how many errors vs how many we already passed
-                        error_count = sum(1 for o in outputs if o.startswith("ERROR:"))
-                        if error_count == len(outputs):
-                            # All coders errored - genuine coder failure
-                            code_failed = True
-                            failed_error = f"Judge AI 판결 (CODER 잘못): {judge_result.get('reason')}\n출력결과들: {outputs}"
-                            failed_input = actual_input
-                            break
-                        else:
-                            # Some passed, some failed - use the majority output
-                            from collections import Counter
-                            cnt = Counter(o for o in outputs if not o.startswith("ERROR:"))
-                            expected_output = cnt.most_common(1)[0][0]
-                    else:
-                        expected_output = str(judge_result.get("expected_output", unique_outputs[0] if unique_outputs else ""))
-                else:
-                    # All 3 coders agreed - trust the consensus immediately (no Verifier needed)
-                    expected_output = unique_outputs[0]
-                    
-                # Filter surviving codes: must exactly match the expected output
-                surviving_code_indices = [i for i in surviving_code_indices if outputs[i] == expected_output]
-                
-                if not surviving_code_indices:
-                    print("Agent: No code perfectly matched the expected output.")
-                    code_failed = True
-                    failed_error = f"Logical Error: AI outputs diverged and all surviving codes failed to produce the correct expected output: {expected_output}."
-                    failed_input = actual_input
-                    break
-                    
-                # ✅ No Verifier AI call - trust 3-coder consensus and Judge arbitration
-                successful_cases.append({
-                    "case_name": case.get("case_name", f"Edge Case {idx+1}"),
-                    "reason": case.get("reason", ""),
-                    "input": actual_input,
-                    "expected_output": expected_output
+            if len(error_types) == len(outputs) and len(set(error_types)) == 1:
+                err_type = error_types[0]
+                case_fail_counts[case_name] = case_fail_counts.get(case_name, 0) + 1
+                if case_fail_counts[case_name] >= 3:
+                    blacklist_cases.add(case_name)
+                judge_logs.append({
+                    "attempt": attempt + 1,
+                    "case_name": case_name,
+                    "fault": "TESTER",
+                    "reason": f"자동 감지: 모든 Coder가 {err_type} 발생 ({case_fail_counts[case_name]}회). 케이스를 스킵합니다."
                 })
-                        
-            if not code_failed:
-                final_testcases = successful_cases
-                final_solution_code = solution_codes[surviving_code_indices[0]]
-                break
-            else:
-                print(f"Agent: Coder AI codes failed. Requesting self-healing... Error: {failed_error[:100]}")
-                if attempt < max_agent_retries - 1:
-                    async with httpx.AsyncClient() as client:
-                        tasks = [call_coder_ai_async(client, request.problem_text, failed_error, solution_codes[0], failed_input) for _ in range(3)]
-                        solution_codes = await asyncio.gather(*tasks)
-                        solution_codes = [c for c in solution_codes if c]
-                        
-                    if not solution_codes:
-                        break
-                    
-        finally:
-            for path in temp_paths:
-                if os.path.exists(path):
-                    os.remove(path)
+                continue
+            
+            valid_outputs = [o for o in outputs if not o.startswith("ERROR:")]
+            unique_outputs = list(set(valid_outputs))
+            
+            if not valid_outputs or len(unique_outputs) > 1:
+                print(f"Agent: Errors or divergence detected. Calling Judge AI...")
+                judge_result = await call_judge_ai(client, request.problem_text, actual_input, outputs)
                 
-    if not final_testcases:
+                judge_logs.append({
+                    "attempt": attempt + 1,
+                    "case_name": case_name,
+                    "fault": judge_result.get("fault", "CODER"),
+                    "reason": judge_result.get("reason", "")
+                })
+                
+                if judge_result.get("fault") == "TESTER":
+                    continue
+                elif judge_result.get("fault") == "CODER":
+                    error_count = sum(1 for o in outputs if o.startswith("ERROR:"))
+                    if error_count == len(outputs):
+                        code_failed = True
+                        failed_error = f"Judge AI 판결 (CODER 잘못): {judge_result.get('reason')}\n출력결과들: {outputs}"
+                        failed_input = actual_input
+                        break
+                    else:
+                        from collections import Counter
+                        cnt = Counter(o for o in outputs if not o.startswith("ERROR:"))
+                        expected_output = cnt.most_common(1)[0][0]
+                else:
+                    expected_output = str(judge_result.get("expected_output", unique_outputs[0] if unique_outputs else ""))
+            else:
+                expected_output = unique_outputs[0]
+                
+            new_surviving = []
+            for i, o in zip(surviving_code_indices, outputs):
+                if o == expected_output:
+                    new_surviving.append(i)
+            surviving_code_indices = new_surviving
+            
+            if not surviving_code_indices:
+                code_failed = True
+                failed_error = f"Logical Error: AI outputs diverged and all surviving codes failed to produce the correct expected output: {expected_output}."
+                failed_input = actual_input
+                break
+                
+            successful_cases.append({
+                "case_name": case_name,
+                "reason": case.get("reason", ""),
+                "input": actual_input,
+                "expected_output": expected_output
+            })
+                    
+        if not code_failed and len(successful_cases) >= 3 :
+            final_testcases = successful_cases
+            return {
+                "solution_code": solution_codes[surviving_code_indices[0]],
+                "testcases": final_testcases,
+                "judge_logs": judge_logs
+            }
+        else:
+            print(f"Agent: Coder AI codes failed. Requesting self-healing... Error: {failed_error[:100]}")
+            if attempt < max_agent_retries - 1:
+                tasks = [call_coder_ai_async(client, request.problem_text, failed_error, solution_codes[surviving_code_indices[0] if surviving_code_indices else 0], failed_input) for _ in range(3)]
+                solution_codes = await asyncio.gather(*tasks)
+                solution_codes = [c for c in solution_codes if c]
+                if not solution_codes:
+                    break
+                surviving_code_indices = list(range(len(solution_codes)))
+                
+    print(f"Agent: Max retries ({max_agent_retries}) reached. Returning best available code.")
+    if solution_codes:
+        return {
+            "solution_code": solution_codes[0],
+            "testcases": successful_cases[:5],
+            "judge_logs": judge_logs
+        }
+    else:
         return {
             "error": "Multi-Agent loop failed to generate valid code and testcases.",
             "judge_logs": judge_logs
         }
+
+@app.post("/api/ai/edge-cases", dependencies=[Depends(verify_token)])
+async def generate_full_edge_cases(request: EdgeCaseRequest):
+    async with httpx.AsyncClient() as client:
+        print("Agent: Requesting edge cases from Tester AI...")
+        ai_cases = await call_ollama_edge_case(client, request.problem_text)
+        if not ai_cases:
+            return {"error": "Failed to generate valid JSON testcases."}
+
+        print("Agent: Requesting 3 different solutions from Coder AI concurrently...")
+        tasks = [call_coder_ai_async(client, request.problem_text) for _ in range(3)]
+        solution_codes = await asyncio.gather(*tasks)
         
-    return {
-        "solution_code": final_solution_code,
-        "testcases": final_testcases,
-        "judge_logs": judge_logs
-    }
+        solution_codes = [c for c in solution_codes if c]
+        if not solution_codes:
+            return {"error": "Failed to generate python code."}
+            
+        final_solution_code, sample_passed = await pre_validate_samples(client, request, solution_codes)
+        
+        if not sample_passed:
+            print("Agent: WARNING - Could not generate code that passes sample cases.")
+            return {"error": "Failed to generate code that passes the sample test cases after multiple attempts."}
+            
+        solution_codes[0] = final_solution_code
+        
+        result = await run_coder_tester_loop(client, request, ai_cases, solution_codes)
+        return result
 
 if __name__ == "__main__":
     import uvicorn

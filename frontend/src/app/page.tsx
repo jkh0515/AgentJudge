@@ -3,7 +3,9 @@
 import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import Editor from '@monaco-editor/react';
-import { Play, Terminal, BookOpen, CheckCircle, XCircle, Clock, LayoutDashboard, LogOut, Plus, Trash2, Sparkles, Layers, Bookmark, Save, FolderOpen } from 'lucide-react';
+import { Play, Terminal, BookOpen, CheckCircle, XCircle, Clock, LayoutDashboard, LogOut, Plus, Trash2, Sparkles, Layers, Bookmark, Save, FolderOpen, Image as ImageIcon, UploadCloud, Loader2 } from 'lucide-react';
+import { Panel, Group as PanelGroup, Separator as PanelResizeHandle } from "react-resizable-panels";
+import { fetchEventSource } from '@microsoft/fetch-event-source';
 
 interface TestCase {
   input: string;
@@ -24,9 +26,18 @@ export default function JudgePage() {
   const [status, setStatus] = useState<string>('READY');
   const [user, setUser] = useState<{ email: string; username: string } | null>(null);
 
+  const [isMobile, setIsMobile] = useState<boolean>(false);
+  useEffect(() => {
+    const checkMobile = () => setIsMobile(window.innerWidth < 1024);
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
+    return () => window.removeEventListener('resize', checkMobile);
+  }, []);
+
   // Testcase & Tab management
-  const [activeTab, setActiveTab] = useState<'problem' | 'testcases'>('problem');
+  const [activeTab, setActiveTab] = useState<'upload' | 'problem' | 'testcases'>('upload');
   const [isGeneratingTc, setIsGeneratingTc] = useState<boolean>(false);
+  const [isOcrLoading, setIsOcrLoading] = useState<boolean>(false);
   const [testCases, setTestCases] = useState<TestCase[]>([
     { input: "10 10\n", expected_output: "20" }
   ]);
@@ -43,6 +54,12 @@ export default function JudgePage() {
       const res = await fetch('/api/problems', {
         headers: { 'Authorization': `Bearer ${token}` }
       });
+      if (res.status === 401) {
+        localStorage.removeItem('token');
+        localStorage.removeItem('user');
+        router.push('/login');
+        return;
+      }
       if (res.ok) {
         const data = await res.json();
         setSavedProblems(Array.isArray(data) ? data : []);
@@ -157,7 +174,11 @@ export default function JudgePage() {
       fetch(`/api/users/me/submissions/latest`, {
         headers: { 'Authorization': `Bearer ${token}` }
       })
-        .then(res => res.json())
+        .then(async res => {
+          if (!res.ok) return {};
+          const text = await res.text();
+          return text ? JSON.parse(text) : {};
+        })
         .then(data => {
           if (data && data.problemText !== undefined) {
             setProblemText(data.problemText);
@@ -196,58 +217,134 @@ export default function JudgePage() {
     const token = localStorage.getItem('token');
     setIsGeneratingTc(true);
     setActiveTab('testcases');
-    setOutput(prev => prev + '\n[🤖 AI] 문제 분석 및 엣지 테스트케이스 5개 생성 중...\n');
+    let attempt = 0;
+    const maxRetries = 10;
+    let success = false;
+
+    while (attempt < maxRetries && !success) {
+      attempt++;
+      setOutput(prev => prev + `\n[🤖 AI] 문제 분석 및 엣지 테스트케이스 5개 생성 중... (시도 ${attempt}/${maxRetries})\n`);
+
+      try {
+        // Use direct backend URL to bypass Next.js 30-second proxy timeout limit
+        const aiApiUrl = process.env.NEXT_PUBLIC_AI_API_URL || 'http://localhost:8000';
+        const response = await fetch(`${aiApiUrl}/api/ai/edge-cases`, {
+          method: 'POST',
+
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify({
+            problem_text: problemText,
+          }),
+        });
+
+        const data = await response.json();
+
+        if (response.status === 401) {
+          localStorage.removeItem('token');
+          localStorage.removeItem('user');
+          router.push('/login');
+          return;
+        }
+
+        let logsMsg = "";
+        if (data && data.judge_logs && data.judge_logs.length > 0) {
+          logsMsg += `\n=== 🔎 [AI 멀티-에이전트 심판 로그] ===\n`;
+          data.judge_logs.forEach((log: any) => {
+            logsMsg += `[Attempt ${log.attempt} - ${log.case_name}]\n`;
+            logsMsg += `👉 판결: ${log.fault === 'NONE' ? '✅ 패스' : `❌ ${log.fault} 잘못`}\n`;
+            logsMsg += `👉 사유: ${log.reason}\n\n`;
+          });
+          logsMsg += `====================================\n\n`;
+        }
+
+        if (!response.ok || data.error) {
+          setOutput(prev => prev + logsMsg + `[🤖 AI Error] ${data.error || "테스트케이스 생성 실패"}\n`);
+          if (attempt === maxRetries) {
+            alert("AI 엣지 케이스 생성 실패 (최대 재시도 초과): " + (data.error || "서버 오류"));
+          } else {
+            setOutput(prev => prev + `[🤖 AI] 실패 감지됨. 즉시 재시도합니다...\n`);
+          }
+          continue;
+        }
+
+        if (data && data.testcases && Array.isArray(data.testcases)) {
+          setTestCases(data.testcases.map((tc: any) => ({
+            input: tc.input || "",
+            expected_output: tc.expected_output || tc.expectedOutput || "",
+            status: 'PENDING'
+          })));
+          let successMsg = logsMsg + `[🤖 AI] 엣지 테스트케이스 ${data.testcases.length}개 생성 완료!\n`;
+          if (data.solution_code) {
+            setCode(data.solution_code);
+            successMsg += `[🤖 AI] 자가 치유(Self-Healing) 및 최종 검증을 통과한 최적화 정답 코드가 에디터에 적용되었습니다!\n`;
+          }
+          setOutput(prev => prev + successMsg);
+          success = true; // Mark as success to exit the loop
+        }
+      } catch (error: any) {
+        setOutput(prev => prev + `[🤖 AI Error] ${error.message}\n`);
+        if (attempt === maxRetries) {
+          alert("AI 엣지 케이스 생성에 실패했습니다: " + error.message);
+        } else {
+          setOutput(prev => prev + `[🤖 AI] 네트워크 또는 런타임 오류 감지됨. 즉시 재시도합니다...\n`);
+        }
+      }
+    }
+
+    setIsGeneratingTc(false);
+  };
+
+  const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!e.target.files || e.target.files.length === 0) return;
+    const file = e.target.files[0];
+
+    setIsOcrLoading(true);
+    setOutput(prev => prev + `\n[🤖 AI] 이미지에서 문제 텍스트 추출 중...\n`);
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const token = localStorage.getItem('token');
     try {
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
-      const response = await fetch(`${apiUrl}/api/ai/testcases`, {
+      // Use direct backend URL to bypass Next.js 30-second proxy timeout limit
+      const aiApiUrl = process.env.NEXT_PUBLIC_AI_API_URL || 'http://localhost:8000';
+      const res = await fetch(`${aiApiUrl}/api/ai/ocr`, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`
         },
-        body: JSON.stringify({
-          problem_text: problemText,
-        }),
+        body: formData
       });
 
-      const data = await response.json();
-      
-      let logsMsg = "";
-      if (data && data.judge_logs && data.judge_logs.length > 0) {
-        logsMsg += `\n=== 🔎 [AI 멀티-에이전트 심판 로그] ===\n`;
-        data.judge_logs.forEach((log: any) => {
-          logsMsg += `[Attempt ${log.attempt} - ${log.case_name}]\n`;
-          logsMsg += `👉 판결: ${log.fault === 'NONE' ? '✅ 패스' : `❌ ${log.fault} 잘못`}\n`;
-          logsMsg += `👉 사유: ${log.reason}\n\n`;
-        });
-        logsMsg += `====================================\n\n`;
-      }
-      
-      if (!response.ok || data.error) {
-        setOutput(prev => prev + logsMsg + `[🤖 AI Error] ${data.error || "테스트케이스 생성 실패"}\n`);
-        alert("AI 엣지 케이스 생성 실패: " + (data.error || "서버 오류"));
-        setIsGeneratingTc(false);
+      if (res.status === 401) {
+        localStorage.removeItem('token');
+        localStorage.removeItem('user');
+        router.push('/login');
         return;
       }
 
-      if (data && data.testcases && Array.isArray(data.testcases)) {
-        setTestCases(data.testcases.map((tc: any) => ({
-          input: tc.input || "",
-          expected_output: tc.expected_output || tc.expectedOutput || "",
-          status: 'PENDING'
-        })));
-        let successMsg = logsMsg + `[🤖 AI] 엣지 테스트케이스 ${data.testcases.length}개 생성 완료!\n`;
-        if (data.solution_code) {
-          setCode(data.solution_code);
-          successMsg += `[🤖 AI] 자가 치유(Self-Healing) 및 최종 검증을 통과한 최적화 정답 코드가 에디터에 적용되었습니다!\n`;
-        }
-        setOutput(prev => prev + successMsg);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "OCR 실패");
+
+      let ocrLog = `[🤖 AI] 문제 텍스트 추출 완료!\n\n`;
+      if (data.raw_text) {
+        ocrLog += `=== 🔍 [원본 OCR 텍스트] ===\n${data.raw_text}\n============================\n\n`;
       }
-    } catch (error: any) {
-      setOutput(prev => prev + `[🤖 AI Error] ${error.message}\n`);
-      alert("AI 엣지 케이스 생성에 실패했습니다: " + error.message);
+      ocrLog += `[🤖 AI] 텍스트 정제(Refining) 완료. 편집 창에 적용되었습니다.\n`;
+
+      setProblemText(data.refined_text);
+      setOutput(prev => prev + ocrLog);
+      setActiveTab('problem'); // 자동으로 편집 탭으로 이동
+    } catch (err: any) {
+      alert("이미지 처리 실패: " + err.message);
+      setOutput(prev => prev + `[🤖 AI Error] ${err.message}\n`);
     } finally {
-      setIsGeneratingTc(false);
+      setIsOcrLoading(false);
+      // reset file input
+      e.target.value = '';
     }
   };
 
@@ -315,6 +412,13 @@ export default function JudgePage() {
         }),
       });
 
+      if (response.status === 401) {
+        localStorage.removeItem('token');
+        localStorage.removeItem('user');
+        router.push('/login');
+        return;
+      }
+
       const data = await response.json();
 
       if (!response.ok) {
@@ -324,53 +428,67 @@ export default function JudgePage() {
       const submissionId = data.submission_id;
       setOutput(prev => prev + `Submission successful! (ID: ${submissionId})\nParallel workers executing ${testCases.length} test cases...\n`);
 
-      const eventSource = new EventSource(`/api/submissions/${submissionId}/stream`);
+      const ctrl = new AbortController();
 
-      eventSource.addEventListener('connect', (e) => {
-        setOutput(prev => prev + `[Connected] ${e.data}\nWaiting for worker pool...\n`);
-      });
-
-      eventSource.addEventListener('testcase_result', (e) => {
-        const result = JSON.parse(e.data);
-        setTestCases(prev => prev.map((tc, idx) => {
-          if (idx === result.index - 1) {
-            return {
-              ...tc,
-              status: result.status === 'SUCCESS' ? 'SUCCESS' : 'FAIL',
-              output: result.output,
-              exec_time: result.exec_time,
-              memory_kb: result.memory_kb
-            };
+      await fetchEventSource(`/api/submissions/${submissionId}/stream`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'text/event-stream'
+        },
+        signal: ctrl.signal,
+        async onopen(response) {
+          if (response.ok && response.headers.get('content-type')?.includes('text/event-stream')) {
+            return; // everything's good
+          } else if (response.status === 401) {
+            localStorage.removeItem('token');
+            localStorage.removeItem('user');
+            router.push('/login');
+            ctrl.abort();
+          } else {
+            throw new Error(`Failed to connect (status ${response.status})`);
           }
-          return tc;
-        }));
-      });
+        },
+        onmessage(msg) {
+          if (msg.event === 'connect') {
+            setOutput(prev => prev + `[Connected] ${msg.data}\nWaiting for worker pool...\n`);
+          } else if (msg.event === 'testcase_result') {
+            const result = JSON.parse(msg.data);
+            setTestCases(prev => prev.map((tc, idx) => {
+              if (idx === result.index - 1) {
+                return {
+                  ...tc,
+                  status: result.status === 'SUCCESS' ? 'SUCCESS' : 'FAIL',
+                  output: result.output,
+                  exec_time: result.exec_time,
+                  memory_kb: result.memory_kb
+                };
+              }
+              return tc;
+            }));
+          } else if (msg.event === 'judge_result') {
+            const result = JSON.parse(msg.data);
+            setStatus(result.status);
+            
+            let formattedOutput = `\n[Final Result: ${result.status}]\n`;
+            if (result.output) {
+              formattedOutput += `${result.output}\n`;
+            }
 
-      eventSource.addEventListener('judge_result', (e) => {
-        const result = JSON.parse(e.data);
-        setStatus(result.status);
-
-        let formattedOutput = `\n[Final Result: ${result.status}]\n`;
-        if (result.output) {
-          formattedOutput += `${result.output}\n`;
+            setOutput(prev => prev + formattedOutput);
+            setIsSubmitting(false);
+            ctrl.abort(); // close connection cleanly
+          }
+        },
+        onerror(err) {
+          setOutput(prev => prev + '\n[Error] Connection to stream lost.\n');
+          setIsSubmitting(false);
+          setStatus(prev => prev === 'PENDING' ? 'ERROR' : prev);
+          ctrl.abort(); // Stop retrying
         }
-
-        setOutput(prev => prev + formattedOutput);
-
-        eventSource.close();
-        setIsSubmitting(false);
       });
-
-      eventSource.onerror = (e) => {
-        setOutput(prev => prev + '\n[Error] Connection to stream lost.\n');
-        eventSource.close();
-        setIsSubmitting(false);
-        if (status === 'PENDING') {
-          setStatus('ERROR');
-        }
-      };
 
     } catch (error: any) {
+      if (error.name === 'AbortError') return;
       setOutput(prev => prev + `\n[Error] ${error.message}\n`);
       setStatus('ERROR');
       setIsSubmitting(false);
@@ -392,6 +510,13 @@ export default function JudgePage() {
           failedCode: code,
         }),
       });
+
+      if (response.status === 401) {
+        localStorage.removeItem('token');
+        localStorage.removeItem('user');
+        router.push('/login');
+        return;
+      }
 
       const data = await response.json();
       if (!response.ok) throw new Error(data.error);
@@ -458,8 +583,8 @@ export default function JudgePage() {
             onClick={handleSubmit}
             disabled={isSubmitting}
             className={`flex items-center gap-2 px-5 py-2.5 rounded-xl font-medium transition-all duration-300 ${isSubmitting
-                ? 'bg-slate-700 text-slate-400 cursor-not-allowed'
-                : 'bg-blue-600 hover:bg-blue-500 hover:shadow-[0_0_20px_rgba(59,130,246,0.4)] text-white'
+              ? 'bg-slate-700 text-slate-400 cursor-not-allowed'
+              : 'bg-blue-600 hover:bg-blue-500 hover:shadow-[0_0_20px_rgba(59,130,246,0.4)] text-white'
               }`}
           >
             <Play className="w-4 h-4" />
@@ -469,31 +594,39 @@ export default function JudgePage() {
       </header>
 
       {/* Main Content */}
-      <div className="flex-1 flex flex-col lg:flex-row gap-6 min-h-0">
+      <PanelGroup id="ide-layout-main-v3" orientation={isMobile ? "vertical" : "horizontal"} className="flex-1 min-h-0">
 
         {/* Left Panel: Problem Description & Testcases */}
-        <div className="lg:w-1/3 flex flex-col gap-4 glass rounded-2xl p-6 relative min-h-0 overflow-hidden">
+        <Panel defaultSize={30} minSize={20} className="flex flex-col gap-4 glass rounded-2xl p-6 relative min-h-0 overflow-hidden">
           {/* Tabs Header */}
           <div className="flex items-center justify-between border-b border-slate-700/50 pb-3">
             <div className="flex gap-2">
               <button
+                onClick={() => setActiveTab('upload')}
+                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-all ${activeTab === 'upload'
+                    ? 'bg-emerald-600 text-white shadow-lg shadow-emerald-500/20'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
+                  }`}
+              >
+                <ImageIcon className="w-4 h-4" />
+                이미지 업로드
+              </button>
+              <button
                 onClick={() => setActiveTab('problem')}
-                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-all ${
-                  activeTab === 'problem'
+                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-all ${activeTab === 'problem'
                     ? 'bg-blue-600 text-white shadow-lg shadow-blue-500/20'
                     : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
-                }`}
+                  }`}
               >
                 <BookOpen className="w-4 h-4" />
-                문제 설명
+                문제 편집
               </button>
               <button
                 onClick={() => setActiveTab('testcases')}
-                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-all ${
-                  activeTab === 'testcases'
+                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-all ${activeTab === 'testcases'
                     ? 'bg-purple-600 text-white shadow-lg shadow-purple-500/20'
                     : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
-                }`}
+                  }`}
               >
                 <Layers className="w-4 h-4" />
                 테스트케이스 ({testCases.length})
@@ -512,8 +645,45 @@ export default function JudgePage() {
             )}
           </div>
 
+          {/* Tab 0 Content: Image Upload */}
+          {activeTab === 'upload' && (
+            <div className="flex-1 flex flex-col items-center justify-center gap-4 min-h-0 border-2 border-dashed border-slate-700/50 rounded-2xl bg-slate-900/30 hover:bg-slate-900/50 transition-colors p-8 relative">
+              <input
+                type="file"
+                accept="image/*"
+                onChange={handleImageUpload}
+                disabled={isOcrLoading}
+                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10 disabled:cursor-not-allowed"
+                title="이미지를 드래그 앤 드롭 하거나 클릭하여 업로드하세요."
+              />
+
+              <div className="flex flex-col items-center gap-3 text-center z-0 pointer-events-none">
+                {isOcrLoading ? (
+                  <>
+                    <Loader2 className="w-12 h-12 text-blue-500 animate-spin" />
+                    <p className="text-blue-400 font-medium">AI가 이미지에서 문제를 읽고 다듬는 중입니다...</p>
+                    <p className="text-xs text-slate-500">최대 10~20초 정도 소요될 수 있습니다.</p>
+                  </>
+                ) : (
+                  <>
+                    <div className="w-16 h-16 bg-slate-800 rounded-full flex items-center justify-center shadow-lg shadow-black/20 mb-2">
+                      <UploadCloud className="w-8 h-8 text-blue-400" />
+                    </div>
+                    <p className="text-slate-200 font-semibold text-lg">알고리즘 문제 이미지 업로드</p>
+                    <p className="text-sm text-slate-400 max-w-xs">
+                      백준, 프로그래머스 등의 문제 화면을 캡처해서 여기에 드래그 앤 드롭 하거나 클릭하여 파일을 선택하세요.
+                    </p>
+                    <div className="px-4 py-2 bg-blue-600/20 text-blue-400 rounded-lg text-xs font-medium mt-2">
+                      AI가 자동으로 텍스트를 추출하고 정리해줍니다 ✨
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* Tab 1 Content: Problem Textarea */}
-          {activeTab === 'problem' ? (
+          {activeTab === 'problem' && (
             <div className="flex-1 flex flex-col gap-2 min-h-0">
               <div className="flex gap-2 items-center">
                 <input
@@ -543,8 +713,10 @@ export default function JudgePage() {
                 onChange={(e) => setProblemText(e.target.value)}
               />
             </div>
-          ) : (
-            /* Tab 2 Content: Testcases List */
+          )}
+          
+          {/* Tab 2 Content: Testcases List */}
+          {activeTab === 'testcases' && (
             <div className="flex-1 flex flex-col gap-3 min-h-0 overflow-y-auto pr-1">
               <div className="flex items-center justify-between mb-1">
                 <span className="text-xs text-slate-400">Run Code 시 아래 테스트케이스들이 병렬 채점됩니다.</span>
@@ -634,13 +806,17 @@ export default function JudgePage() {
               </button>
             </div>
           )}
-        </div>
+        </Panel>
+
+        <PanelResizeHandle className="w-6 hidden lg:flex bg-slate-800/20 hover:bg-purple-500/10 rounded-full transition-colors cursor-col-resize shrink-0 z-20 items-center justify-center group relative">
+            <div className="w-1 h-8 bg-slate-600 rounded-full group-hover:bg-purple-400 transition-colors" />
+        </PanelResizeHandle>
 
         {/* Right Panel: Editor and Terminal */}
-        <div className="lg:w-2/3 flex flex-col gap-6 min-h-0">
-
-          {/* Editor */}
-          <div className="flex-1 glass rounded-2xl overflow-hidden flex flex-col border border-slate-700/50 relative">
+        <Panel defaultSize={70} minSize={30} className="flex flex-col min-h-0">
+          <PanelGroup id="ide-layout-right-v2" orientation="vertical" className="flex-1 flex min-h-0">
+            {/* Editor */}
+            <Panel defaultSize={70} minSize={20} className="glass rounded-2xl overflow-hidden flex flex-col border border-slate-700/50 relative">
             <div className="h-10 bg-slate-900/80 flex items-center justify-between px-4 border-b border-slate-800 backdrop-blur-md z-10">
               <div className="flex gap-2">
                 <div className="w-3 h-3 rounded-full bg-red-500/80"></div>
@@ -667,10 +843,14 @@ export default function JudgePage() {
                 }}
               />
             </div>
-          </div>
+          </Panel>
+
+          <PanelResizeHandle className="h-4 w-full flex bg-transparent hover:bg-purple-500/10 transition-colors cursor-row-resize shrink-0 z-20 items-center justify-center group relative my-1">
+              <div className="h-1 w-12 bg-slate-700/50 rounded-full group-hover:bg-purple-400 transition-colors" />
+          </PanelResizeHandle>
 
           {/* Terminal / Output */}
-          <div className="h-64 glass rounded-2xl p-4 flex flex-col relative">
+          <Panel defaultSize={30} minSize={15} className="glass rounded-2xl p-4 flex flex-col relative">
             <div className="flex items-center justify-between gap-2 mb-3 text-slate-400 pb-2 border-b border-slate-700/50">
               <div className="flex items-center gap-2">
                 <Terminal className="w-4 h-4" />
@@ -688,10 +868,10 @@ export default function JudgePage() {
             <div className="flex-1 bg-[#0a0f1a] rounded-xl p-4 font-mono text-sm overflow-y-auto whitespace-pre-wrap border border-slate-800 text-green-400 shadow-inner">
               {output || 'Run your code to see the output here...'}
             </div>
-          </div>
-
-        </div>
-      </div>
+          </Panel>
+          </PanelGroup>
+        </Panel>
+      </PanelGroup>
 
       {/* Problem Library Modal */}
       {isProblemModalOpen && (

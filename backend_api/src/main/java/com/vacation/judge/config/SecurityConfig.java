@@ -39,7 +39,6 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers("/api/auth/**").permitAll()
                         .requestMatchers("/api/sse/**").permitAll()
-                        .requestMatchers("/api/submissions/*/stream").permitAll()
                         .requestMatchers("/api/ai/**").permitAll()
                         .anyRequest().authenticated()
                 )

@@ -18,10 +18,14 @@ services:
     build:
       context: ./ai_server
     container_name: judge_ai_server
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
     ports:
       - "8000:8000"
     environment:
       - OLLAMA_URL=http://host.docker.internal:11434/api/generate
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./ai_server:/app
     restart: unless-stopped
 
   redis:

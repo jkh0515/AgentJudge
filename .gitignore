@@ -6,6 +6,9 @@
 venv/
 env/
 
+test_image
+test_image/*
+
 # AI (dataset, models)
 ai_model
 ai_model/*
