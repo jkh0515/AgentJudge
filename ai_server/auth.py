@@ -1,8 +1,15 @@
 import os
 import base64
 import jwt
+import time
+from collections import defaultdict
 from fastapi import Request, HTTPException, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+# Rate Limiting configuration
+RATE_LIMIT_DB = defaultdict(list)
+RATE_LIMIT_WINDOW = 60  # 1 minute window
+RATE_LIMIT_MAX = 5      # Max 5 requests per minute per user
 
 security = HTTPBearer()
 
@@ -26,6 +33,22 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Security(secu
     try:
         # Verify the token using PyJWT (Spring Boot might use HS384 or HS512 depending on key length)
         payload = jwt.decode(token, JWT_SECRET_BYTES, algorithms=["HS256", "HS384", "HS512"])
+        
+        # --- Rate Limiting Logic ---
+        user_id = payload.get("sub", "anonymous")
+        now = time.time()
+        
+        # Clean up old timestamps outside the window
+        RATE_LIMIT_DB[user_id] = [t for t in RATE_LIMIT_DB[user_id] if now - t < RATE_LIMIT_WINDOW]
+        
+        if len(RATE_LIMIT_DB[user_id]) >= RATE_LIMIT_MAX:
+            print(f"Rate limit exceeded for user: {user_id}")
+            raise HTTPException(status_code=429, detail="Too Many Requests. Please wait a minute before requesting AI again.")
+            
+        # Record this new request
+        RATE_LIMIT_DB[user_id].append(now)
+        # ---------------------------
+        
         return payload
     except jwt.ExpiredSignatureError:
         print("Token expired error")

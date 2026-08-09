@@ -62,6 +62,8 @@ def run_judge(submission_id: int, code: str, language: str, input_data: str = ""
             mem_limit="256m",
             pids_limit=64,
             cap_drop=["ALL"],
+            user="nobody",
+            working_dir="/tmp",
             detach=True
         )
         
