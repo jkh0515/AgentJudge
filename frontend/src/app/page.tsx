@@ -232,7 +232,7 @@ export default function JudgePage() {
       setOutput(prev => prev + `\n[🤖 AI] 문제 분석 및 엣지 테스트케이스 5개 생성 중... (시도 ${attempt}/${maxRetries})\n`);
 
       try {
-        const response = await fetch(`/api/ai/edge-cases`, {
+        const response = await fetch(`/ai-proxy/edge-cases`, {
           method: 'POST',
 
           headers: {
@@ -312,7 +312,7 @@ export default function JudgePage() {
     setOutput(prev => prev + `\n[🤖 AI] 작성된 텍스트를 백준 스타일로 정제 중...\n`);
 
     try {
-      const response = await fetch(`/api/ai/refine`, {
+      const response = await fetch(`/ai-proxy/refine`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -355,7 +355,7 @@ export default function JudgePage() {
     setOutput(prev => prev + `\n[🤖 AI] 원본 OCR 텍스트를 백준 스타일로 정제 중...\n`);
 
     try {
-      const response = await fetch(`/api/ai/refine`, {
+      const response = await fetch(`/ai-proxy/refine`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -406,7 +406,7 @@ export default function JudgePage() {
 
     const token = localStorage.getItem('token');
     try {
-      const res = await fetch(`/api/ai/ocr`, {
+      const res = await fetch(`/ai-proxy/ocr`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${token}`,
@@ -596,7 +596,7 @@ export default function JudgePage() {
     const token = localStorage.getItem('token');
     setOutput(prev => prev + '\n[🤖 AI] 분석 중... (시간이 조금 걸릴 수 있습니다)\n');
     try {
-      const response = await fetch(`/api/ai/hint`, {
+      const response = await fetch(`/ai-proxy/hint`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
