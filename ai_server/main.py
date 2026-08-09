@@ -73,12 +73,16 @@ MODEL_NAME = "qwen2.5:7b" # Or llama3
 class HintRequest(BaseModel):
     problem_text: str
     failed_code: str
+    answer_code: Optional[str] = None
 
 class TestcaseRequest(BaseModel):
     problem_text: str
 
 class EdgeCaseRequest(BaseModel):
     problem_text: str
+
+class RefineRequest(BaseModel):
+    raw_text: str
 
 async def call_ollama(client: httpx.AsyncClient, prompt: str, format_json: bool = False, temperature: float = None) -> str:
     """Helper function to call local Ollama API asynchronously."""
@@ -112,11 +116,72 @@ def process_image_sync(content: bytes, temp_path: str):
         with open(temp_path, 'wb') as f:
             f.write(content)
 
+async def refine_text_with_llm(raw_text: str) -> str:
+    prompt = f"""
+You are an expert algorithm problem writer. 
+I will give you a completely broken, corrupted OCR text of a programming problem, OR a rough draft of a problem.
+Your job is to COMPLETELY REWRITE it into a natural, perfect Korean algorithm problem.
+
+You MUST wrap your final Korean text strictly inside <result> and </result> tags. DO NOT add any conversational preamble.
+
+[RULES]
+1. COMPLETELY REWRITE: Do NOT try to preserve weird alien text (like '|o롬으릉', 'Yo言', '머우어0윙', '람RYPTO', 'Ioly울'). Completely throw them away and REWRITE the sentence so it makes logical sense in Korean.
+2. NATURAL FLOW: Ensure it reads perfectly smoothly as a standard Baekjoon or Programmers problem.
+3. PRESERVE LOGIC: You can change the wording to fix broken sentences, but do NOT alter the math rules, variable names (N, M, t), or numbers.
+4. LAYOUT FORMATTING: Add empty lines between paragraphs. ALWAYS add an empty line before sections like "문제", "입력", "출력", "예제 입력 1", "예제 출력 1".
+5. FREEZE EXAMPLES: The data under "예제 입력 1" and "예제 출력 1" MUST be kept absolutely identical to the raw text. Do not format it.
+
+<raw_text>
+{raw_text}
+"""
+    max_retries = 7
+    final_text = ""
+    
+    async with httpx.AsyncClient() as client:
+        for attempt in range(max_retries):
+            temp = 0.2 + (attempt * 0.1)
+            llm_response = await call_ollama(client, prompt, temperature=temp)
+            
+            if re.search(r'[一-鿿]', llm_response):
+                print(f"Agent: OCR Refiner attempt {attempt+1} contained Chinese. Retrying with temp {temp}...")
+                continue
+                
+            match = re.search(r'<result>(.*?)</result>', llm_response, re.DOTALL)
+            if match:
+                final_text = match.group(1).strip()
+                if final_text:
+                    return final_text
+            
+            fallback_match = re.search(r'(#\s*문제.*)', llm_response, re.DOTALL | re.IGNORECASE)
+            if fallback_match:
+                final_text = fallback_match.group(1).strip()
+                final_text = re.sub(r'\n\n(위와 같이|여기 정제된|도움이 되셨나요|Here is|Hope this helps).*$', '', final_text, flags=re.DOTALL)
+                if final_text:
+                    print(f"Agent: OCR Refiner used fallback regex to extract problem text.")
+                    return final_text
+            
+            print(f"Agent: Invalid output or missing <result> tags in OCR Refiner (Attempt {attempt+1}/{max_retries}). Retrying with temp {temp}...")
+            print(f"RAW: {repr(llm_response)}")
+            
+    print("Agent: Failed to generate clean text. Applying raw text fallback.")
+    return "[AI 정제 실패: 원본 텍스트를 반환합니다]\n\n" + raw_text
+
+@app.post("/api/ai/refine", dependencies=[Depends(verify_token)])
+async def refine_problem(request: RefineRequest):
+    """
+    Takes raw problem text and refines it into a clean Baekjoon style problem.
+    """
+    if not request.raw_text.strip():
+        raise HTTPException(status_code=400, detail="Text cannot be empty.")
+        
+    refined_text = await refine_text_with_llm(request.raw_text)
+    return {"refined_text": refined_text}
+
 @app.post("/api/ai/ocr", dependencies=[Depends(verify_token)])
 async def extract_and_refine_problem(file: UploadFile = File(...)):
     """
     1. Runs OCR on uploaded image (offloaded to thread).
-    2. Uses Ollama to format the problem as clean plain text.
+    2. Returns raw text immediately.
     """
     if not file.content_type.startswith('image/'):
         raise HTTPException(status_code=400, detail="File must be an image.")
@@ -140,61 +205,8 @@ async def extract_and_refine_problem(file: UploadFile = File(...)):
         if not raw_text.strip():
             return {"error": "No text detected in the image."}
 
-        # 2. Problem Formatting via LLM
-        prompt = f"""
-You are an expert algorithm problem writer. 
-I will give you a completely broken, corrupted OCR text of a programming problem.
-Your job is to COMPLETELY REWRITE it into a natural, perfect Korean algorithm problem.
-
-You MUST wrap your final Korean text strictly inside <result> and </result> tags. DO NOT add any conversational preamble.
-
-[RULES]
-1. COMPLETELY REWRITE: Do NOT try to preserve weird alien text (like '|o롬으릉', 'Yo言', '머우어0윙', '람RYPTO', 'Ioly울'). Completely throw them away and REWRITE the sentence so it makes logical sense in Korean.
-2. NATURAL FLOW: Ensure it reads perfectly smoothly as a standard Baekjoon or Programmers problem.
-3. PRESERVE LOGIC: You can change the wording to fix broken sentences, but do NOT alter the math rules, variable names (N, M, t), or numbers.
-4. LAYOUT FORMATTING: Add empty lines between paragraphs. ALWAYS add an empty line before sections like "문제", "입력", "출력", "예제 입력 1", "예제 출력 1".
-5. FREEZE EXAMPLES: The data under "예제 입력 1" and "예제 출력 1" MUST be kept absolutely identical to the raw text. Do not format it.
-
-<raw_text>
-{raw_text}
-"""
-        max_retries = 7
-        llm_response = ""
-        final_text = ""
-        
-        async with httpx.AsyncClient() as client:
-            for attempt in range(max_retries):
-                # Dynamic temperature scaling to avoid loop traps
-                temp = 0.2 + (attempt * 0.1)
-                llm_response = await call_ollama(client, prompt, temperature=temp)
-                
-                # Extract text inside <result> tags
-                match = re.search(r'<result>(.*?)</result>', llm_response, re.DOTALL)
-                if match:
-                    final_text = match.group(1).strip()
-                    if final_text:
-                        break
-                
-                # Fallback if they forgot tags but included # 문제 (common LLM behavior)
-                fallback_match = re.search(r'(#\s*문제.*)', llm_response, re.DOTALL | re.IGNORECASE)
-                if fallback_match:
-                    final_text = fallback_match.group(1).strip()
-                    # Clean up trailing conversational text if any
-                    final_text = re.sub(r'\n\n(위와 같이|여기 정제된|도움이 되셨나요|Here is|Hope this helps).*$', '', final_text, flags=re.DOTALL)
-                    if final_text:
-                        print(f"Agent: OCR Refiner used fallback regex to extract problem text.")
-                        break
-                
-                print(f"Agent: Invalid output or missing <result> tags in OCR Refiner (Attempt {attempt+1}/{max_retries}). Retrying with temp {temp}...")
-                print(f"RAW: {repr(llm_response)}")
-            else:
-                # Fallback if all retries fail
-                print("Agent: Failed to generate clean text. Applying raw text fallback.")
-                final_text = "[AI 정제 실패: 원본 텍스트를 반환합니다]\n\n" + raw_text
-
         return {
-            "raw_text": raw_text.strip(),
-            "refined_text": final_text
+            "raw_text": raw_text.strip()
         }
 
     finally:
@@ -311,12 +323,20 @@ async def get_hint(request: HintRequest):
     prompt = f"""
 You are the best algorithm coding test tutor.
 The student's code below has either failed or timed out while solving the following problem.
-DO NOT provide the direct answer or full correct code. Analyze the time and space complexity, and provide ONLY the core logical 'hints' in markdown format.
+We also provide you with the Teacher's Correct Answer Code for your reference.
+Please carefully compare the Student's Failed Code with the Teacher's Correct Answer Code.
+Identify the logical flaws, missing edge cases, or inefficiencies in the student's code.
+
+DO NOT provide the direct answer or full correct code to the student. 
+Provide ONLY the core logical 'hints' and explanations of what went wrong in markdown format.
 
 **[WARNING: You MUST respond ONLY in Korean (한국어). NEVER use Chinese or English for the explanation.]**
 
 --- Problem ---
 {request.problem_text}
+
+--- Teacher's Correct Answer Code ---
+{request.answer_code or "Not provided"}
 
 --- Student's Failed Code ---
 {request.failed_code}
@@ -349,13 +369,15 @@ async def call_coder_ai_async(client: httpx.AsyncClient, problem_text: str, erro
     if not error_feedback:
         system_prompt = (
             "당신은 알고리즘 전문가입니다. 주어진 문제의 제약 조건을 완벽하게 준수하여 최적의 알고리즘 답 코드를 생성하세요."
-            " 어떤 부가 설명도 없이 오직 ```python ... ``` 블록으로만 응답하세요. 빠른 출력을 위해 sys.stdin.read를 적극 활용하세요."
+            " 어떤 부가 설명도 없이 오직 ```python ... ``` 블록으로만 응답하세요. "
+            "절대 `input()` 함수를 사용하지 마세요! 모든 입력은 반드시 `import sys; data = sys.stdin.read().split()` 방식으로만 처리해야 합니다."
         )
         user_prompt = problem_text
     else:
         system_prompt = (
             "당신은 알고리즘 전문가입니다. 이전 코드에서 발생한 오류를 수정하여 완전하고 올바른 Python 코드를 작성하세요."
-            " 어떤 부가 설명도 없이 오직 ```python ... ``` 블록으로만 응답하세요. 빠른 출력을 위해 sys.stdin.read를 적극 활용하세요."
+            " 어떤 부가 설명도 없이 오직 ```python ... ``` 블록으로만 응답하세요. "
+            "절대 `input()` 함수를 사용하지 마세요! 모든 입력은 반드시 `import sys; data = sys.stdin.read().split()` 방식으로만 처리해야 합니다."
         )
         user_prompt = f"[문제 설명]\n{problem_text}\n\n[이전 코드]\n{previous_code}\n\n[실패한 입력]\n{failed_input}\n\n[오류 또는 틀린 출력 피드백]\n{error_feedback}\n\n모든 버그를 수정하고 완전히 동작하는 Python 솔루션을 작성하세요."
 

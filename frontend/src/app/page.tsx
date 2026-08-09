@@ -3,7 +3,7 @@
 import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import Editor from '@monaco-editor/react';
-import { Play, Terminal, BookOpen, CheckCircle, XCircle, Clock, LayoutDashboard, LogOut, Plus, Trash2, Sparkles, Layers, Bookmark, Save, FolderOpen, Image as ImageIcon, UploadCloud, Loader2 } from 'lucide-react';
+import { Play, Terminal, BookOpen, CheckCircle, XCircle, Clock, LayoutDashboard, LogOut, Plus, Trash2, Sparkles, Layers, Bookmark, Save, FolderOpen, Image as ImageIcon, UploadCloud, Loader2, Search } from 'lucide-react';
 import { Panel, Group as PanelGroup, Separator as PanelResizeHandle } from "react-resizable-panels";
 import { fetchEventSource } from '@microsoft/fetch-event-source';
 
@@ -18,7 +18,9 @@ interface TestCase {
 
 export default function JudgePage() {
   const router = useRouter();
-  const [code, setCode] = useState<string>('import sys\ndata = sys.stdin.read().strip().split()\nprint(int(data[0]) + int(data[1]))');
+  const [activeCodeTab, setActiveCodeTab] = useState<'answer' | 'mycode'>('mycode');
+  const [answerCode, setAnswerCode] = useState<string>('import sys\ndata = sys.stdin.read().split()\n');
+  const [myCode, setMyCode] = useState<string>('import sys\ndata = sys.stdin.read().split()\n# Your code here');
   const [problemText, setProblemText] = useState<string>('');
   const [language, setLanguage] = useState<string>('python');
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
@@ -38,6 +40,9 @@ export default function JudgePage() {
   const [activeTab, setActiveTab] = useState<'upload' | 'problem' | 'testcases'>('upload');
   const [isGeneratingTc, setIsGeneratingTc] = useState<boolean>(false);
   const [isOcrLoading, setIsOcrLoading] = useState<boolean>(false);
+  const [isRefining, setIsRefining] = useState<boolean>(false);
+  const [rawOcrText, setRawOcrText] = useState<string>('');
+  const [uploadedImagePreview, setUploadedImagePreview] = useState<string | null>(null);
   const [testCases, setTestCases] = useState<TestCase[]>([
     { input: "10 10\n", expected_output: "20" }
   ]);
@@ -94,7 +99,7 @@ export default function JudgePage() {
         body: JSON.stringify({
           title: problemTitle.trim() || "제목 없는 문제",
           description: problemText,
-          code: code,
+          code: answerCode,
           timeLimitMs: 2000,
           memoryLimitMb: 256,
           testCases: testCases.map(tc => ({
@@ -128,7 +133,7 @@ export default function JudgePage() {
         setProblemTitle(data.title || '');
         setProblemText(data.description || '');
         if (data.code !== undefined && data.code !== null) {
-          setCode(data.code);
+          setAnswerCode(data.code);
         }
         if (data.testCases && Array.isArray(data.testCases) && data.testCases.length > 0) {
           setTestCases(data.testCases.map((tc: any) => ({
@@ -182,7 +187,7 @@ export default function JudgePage() {
         .then(data => {
           if (data && data.problemText !== undefined) {
             setProblemText(data.problemText);
-            if (data.code) setCode(data.code);
+            if (data.code) setMyCode(data.code);
             if (data.testCases && Array.isArray(data.testCases) && data.testCases.length > 0) {
               setTestCases(data.testCases.map((tc: any) => ({
                 input: tc.input || "",
@@ -204,7 +209,8 @@ export default function JudgePage() {
 
   const handleEditorChange = (value: string | undefined) => {
     if (value !== undefined) {
-      setCode(value);
+      if (activeCodeTab === 'answer') setAnswerCode(value);
+      else setMyCode(value);
     }
   };
 
@@ -278,7 +284,7 @@ export default function JudgePage() {
           })));
           let successMsg = logsMsg + `[🤖 AI] 엣지 테스트케이스 ${data.testcases.length}개 생성 완료!\n`;
           if (data.solution_code) {
-            setCode(data.solution_code);
+            setAnswerCode(data.solution_code);
             successMsg += `[🤖 AI] 자가 치유(Self-Healing) 및 최종 검증을 통과한 최적화 정답 코드가 에디터에 적용되었습니다!\n`;
           }
           setOutput(prev => prev + successMsg);
@@ -297,9 +303,101 @@ export default function JudgePage() {
     setIsGeneratingTc(false);
   };
 
+  const handleRefineProblem = async () => {
+    if (!problemText.trim()) {
+      alert("문제를 먼저 입력해주세요!");
+      return;
+    }
+    const token = localStorage.getItem('token');
+    setIsRefining(true);
+    setOutput(prev => prev + `\n[🤖 AI] 작성된 텍스트를 백준 스타일로 정제 중...\n`);
+
+    try {
+      const aiApiUrl = process.env.NEXT_PUBLIC_AI_API_URL || 'http://localhost:8000';
+      const response = await fetch(`${aiApiUrl}/api/ai/refine`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ raw_text: problemText }),
+      });
+
+      const data = await response.json();
+
+      if (response.status === 401) {
+        localStorage.removeItem('token');
+        localStorage.removeItem('user');
+        router.push('/login');
+        return;
+      }
+
+      if (!response.ok || data.error) {
+        throw new Error(data.error || "정제 실패");
+      }
+
+      setProblemText(data.refined_text);
+      setOutput(prev => prev + `[🤖 AI] 백준 스타일로 문제 정제 완료! 편집 창에 적용되었습니다.\n`);
+    } catch (error: any) {
+      setOutput(prev => prev + `[🤖 AI Error] ${error.message}\n`);
+      alert("AI 정제 실패: " + error.message);
+    } finally {
+      setIsRefining(false);
+    }
+  };
+
+  const handleRefineFromOcr = async () => {
+    if (!rawOcrText.trim()) {
+      alert("추출된 텍스트가 없습니다.");
+      return;
+    }
+    const token = localStorage.getItem('token');
+    setIsRefining(true);
+    setOutput(prev => prev + `\n[🤖 AI] 원본 OCR 텍스트를 백준 스타일로 정제 중...\n`);
+
+    try {
+      const aiApiUrl = process.env.NEXT_PUBLIC_AI_API_URL || 'http://localhost:8000';
+      const response = await fetch(`${aiApiUrl}/api/ai/refine`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ raw_text: rawOcrText }),
+      });
+
+      const data = await response.json();
+
+      if (response.status === 401) {
+        localStorage.removeItem('token');
+        localStorage.removeItem('user');
+        router.push('/login');
+        return;
+      }
+
+      if (!response.ok || data.error) {
+        throw new Error(data.error || "정제 실패");
+      }
+
+      setProblemText(data.refined_text);
+      setRawOcrText('');
+      setUploadedImagePreview(null);
+      setOutput(prev => prev + `[🤖 AI] 정제 완료! 문제 편집 창에 적용되었습니다.\n`);
+      setActiveTab('problem');
+    } catch (error: any) {
+      setOutput(prev => prev + `[🤖 AI Error] ${error.message}\n`);
+      alert("AI 정제 실패: " + error.message);
+    } finally {
+      setIsRefining(false);
+    }
+  };
+
   const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files || e.target.files.length === 0) return;
     const file = e.target.files[0];
+
+    // Create a local preview URL for the image
+    setUploadedImagePreview(URL.createObjectURL(file));
 
     setIsOcrLoading(true);
     setOutput(prev => prev + `\n[🤖 AI] 이미지에서 문제 텍스트 추출 중...\n`);
@@ -333,11 +431,11 @@ export default function JudgePage() {
       if (data.raw_text) {
         ocrLog += `=== 🔍 [원본 OCR 텍스트] ===\n${data.raw_text}\n============================\n\n`;
       }
-      ocrLog += `[🤖 AI] 텍스트 정제(Refining) 완료. 편집 창에 적용되었습니다.\n`;
+      ocrLog += `[🤖 AI] 업로드 탭에서 텍스트를 확인하고 정제 버튼을 눌러주세요.\n`;
 
-      setProblemText(data.refined_text);
+      setRawOcrText(data.raw_text || '');
       setOutput(prev => prev + ocrLog);
-      setActiveTab('problem'); // 자동으로 편집 탭으로 이동
+      // Removed: setActiveTab('problem');
     } catch (err: any) {
       alert("이미지 처리 실패: " + err.message);
       setOutput(prev => prev + `[🤖 AI Error] ${err.message}\n`);
@@ -383,7 +481,8 @@ export default function JudgePage() {
       setActiveTab('problem');
       return;
     }
-    if (!code.trim()) {
+    const activeCode = activeCodeTab === 'answer' ? answerCode : myCode;
+    if (!activeCode.trim()) {
       setOutput('오류: 코드를 먼저 작성해주세요!');
       return;
     }
@@ -403,7 +502,7 @@ export default function JudgePage() {
         },
         body: JSON.stringify({
           problemText: problemText,
-          code: code,
+          code: activeCodeTab === 'answer' ? answerCode : myCode,
           language: language,
           testCases: testCases.map(tc => ({
             input: tc.input,
@@ -507,7 +606,8 @@ export default function JudgePage() {
         },
         body: JSON.stringify({
           problemText: problemText,
-          failedCode: code,
+          failedCode: activeCodeTab === 'answer' ? answerCode : myCode,
+          answer_code: answerCode,
         }),
       });
 
@@ -647,38 +747,87 @@ export default function JudgePage() {
 
           {/* Tab 0 Content: Image Upload */}
           {activeTab === 'upload' && (
-            <div className="flex-1 flex flex-col items-center justify-center gap-4 min-h-0 border-2 border-dashed border-slate-700/50 rounded-2xl bg-slate-900/30 hover:bg-slate-900/50 transition-colors p-8 relative">
-              <input
-                type="file"
-                accept="image/*"
-                onChange={handleImageUpload}
-                disabled={isOcrLoading}
-                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10 disabled:cursor-not-allowed"
-                title="이미지를 드래그 앤 드롭 하거나 클릭하여 업로드하세요."
-              />
+            <div className={`flex-1 flex flex-col items-center justify-center gap-4 min-h-0 border-2 ${rawOcrText ? 'border-solid border-slate-700 p-4' : 'border-dashed border-slate-700/50 p-8'} rounded-2xl bg-slate-900/30 hover:bg-slate-900/50 transition-colors relative`}>
+              {!rawOcrText ? (
+                <>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={handleImageUpload}
+                    disabled={isOcrLoading}
+                    className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10 disabled:cursor-not-allowed"
+                    title="이미지를 드래그 앤 드롭 하거나 클릭하여 업로드하세요."
+                  />
 
-              <div className="flex flex-col items-center gap-3 text-center z-0 pointer-events-none">
-                {isOcrLoading ? (
-                  <>
-                    <Loader2 className="w-12 h-12 text-blue-500 animate-spin" />
-                    <p className="text-blue-400 font-medium">AI가 이미지에서 문제를 읽고 다듬는 중입니다...</p>
-                    <p className="text-xs text-slate-500">최대 10~20초 정도 소요될 수 있습니다.</p>
-                  </>
-                ) : (
-                  <>
-                    <div className="w-16 h-16 bg-slate-800 rounded-full flex items-center justify-center shadow-lg shadow-black/20 mb-2">
-                      <UploadCloud className="w-8 h-8 text-blue-400" />
+                  <div className="flex flex-col items-center gap-3 text-center z-0 pointer-events-none">
+                    {isOcrLoading ? (
+                      <>
+                        <Loader2 className="w-12 h-12 text-blue-500 animate-spin" />
+                        <p className="text-blue-400 font-medium">AI가 이미지에서 글자를 추출하는 중입니다...</p>
+                        <p className="text-xs text-slate-500">사진의 크기에 따라 10초 정도 소요될 수 있습니다.</p>
+                      </>
+                    ) : (
+                      <>
+                        <div className="w-16 h-16 bg-slate-800 rounded-full flex items-center justify-center shadow-lg shadow-black/20 mb-2">
+                          <UploadCloud className="w-8 h-8 text-blue-400" />
+                        </div>
+                        <p className="text-slate-200 font-semibold text-lg">알고리즘 문제 이미지 업로드</p>
+                        <p className="text-sm text-slate-400 max-w-xs">
+                          백준, 프로그래머스 등의 문제 화면을 캡처해서 여기에 드래그 앤 드롭 하거나 클릭하여 파일을 선택하세요.
+                        </p>
+                        <div className="px-4 py-2 bg-blue-600/20 text-blue-400 rounded-lg text-xs font-medium mt-2">
+                          AI가 이미지에서 텍스트를 자동 추출합니다 ✨
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <div className="w-full h-full flex flex-col gap-4">
+                  {/* Top: Image Preview */}
+                  <div className="w-full h-[250px] border border-slate-700/50 rounded-xl overflow-hidden bg-slate-900/50 flex items-center justify-center p-2 relative shrink-0">
+                    {uploadedImagePreview ? (
+                      <img src={uploadedImagePreview} alt="Uploaded Problem" className="object-contain w-full h-full rounded-lg" />
+                    ) : (
+                      <p className="text-slate-500 text-sm">이미지 미리보기 없음</p>
+                    )}
+                  </div>
+                  
+                  {/* Bottom: OCR Text Area */}
+                  <div className="flex-1 flex flex-col gap-3">
+                    <div className="flex justify-between items-center px-1">
+                      <p className="text-slate-200 font-medium text-sm flex items-center gap-2">
+                        <Search className="w-4 h-4 text-blue-400" />
+                        OCR 추출 결과
+                      </p>
+                      <span className="text-xs text-slate-500">원한다면 오타를 직접 수정할 수 있습니다.</span>
                     </div>
-                    <p className="text-slate-200 font-semibold text-lg">알고리즘 문제 이미지 업로드</p>
-                    <p className="text-sm text-slate-400 max-w-xs">
-                      백준, 프로그래머스 등의 문제 화면을 캡처해서 여기에 드래그 앤 드롭 하거나 클릭하여 파일을 선택하세요.
-                    </p>
-                    <div className="px-4 py-2 bg-blue-600/20 text-blue-400 rounded-lg text-xs font-medium mt-2">
-                      AI가 자동으로 텍스트를 추출하고 정리해줍니다 ✨
+                    <textarea
+                      className="w-full flex-1 bg-slate-900/50 border border-slate-700/50 rounded-xl p-4 text-slate-300 font-mono text-sm resize-none focus:outline-none focus:border-blue-500 transition-all placeholder-slate-600 overflow-y-auto"
+                      value={rawOcrText}
+                      onChange={(e) => setRawOcrText(e.target.value)}
+                      disabled={isRefining}
+                    />
+                    <div className="flex justify-end gap-2 pt-2">
+                      <button
+                        onClick={() => { setRawOcrText(''); setUploadedImagePreview(null); }}
+                        disabled={isRefining}
+                        className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white text-sm rounded-xl transition-all"
+                      >
+                        🔄 다시 업로드
+                      </button>
+                      <button
+                        onClick={handleRefineFromOcr}
+                        disabled={isRefining}
+                        className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm rounded-xl font-medium transition-all shadow-lg flex items-center gap-2"
+                      >
+                        <Sparkles className={`w-4 h-4 ${isRefining ? 'animate-spin' : ''}`} />
+                        {isRefining ? 'AI가 백준 스타일로 정제 중...' : '✨ 이 텍스트를 백준 스타일로 정제하기'}
+                      </button>
                     </div>
-                  </>
-                )}
-              </div>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -693,6 +842,15 @@ export default function JudgePage() {
                   value={problemTitle}
                   onChange={(e) => setProblemTitle(e.target.value)}
                 />
+                <button
+                  onClick={handleRefineProblem}
+                  disabled={isRefining}
+                  className="px-3 py-1.5 bg-indigo-600/80 hover:bg-indigo-600 disabled:bg-slate-700 text-white text-xs rounded-xl flex items-center gap-1.5 transition-all shadow-md font-medium shrink-0"
+                  title="현재 작성된 거친 텍스트를 AI가 백준 스타일로 깔끔하게 다듬어 줍니다."
+                >
+                  <Sparkles className={`w-3.5 h-3.5 ${isRefining ? 'animate-spin' : ''}`} />
+                  {isRefining ? '정제중...' : 'AI 텍스트 정제'}
+                </button>
                 <button
                   onClick={handleSaveProblem}
                   disabled={isSavingProblem}
@@ -819,18 +977,35 @@ export default function JudgePage() {
             <Panel defaultSize={70} minSize={20} className="glass rounded-2xl overflow-hidden flex flex-col border border-slate-700/50 relative">
             <div className="h-10 bg-slate-900/80 flex items-center justify-between px-4 border-b border-slate-800 backdrop-blur-md z-10">
               <div className="flex gap-2">
-                <div className="w-3 h-3 rounded-full bg-red-500/80"></div>
-                <div className="w-3 h-3 rounded-full bg-yellow-500/80"></div>
-                <div className="w-3 h-3 rounded-full bg-green-500/80"></div>
+                <button
+                  onClick={() => setActiveCodeTab('mycode')}
+                  className={`text-xs px-3 py-1.5 rounded-t-lg transition-colors font-medium border-b-2 ${
+                    activeCodeTab === 'mycode' 
+                      ? 'bg-slate-800/80 text-blue-400 border-blue-500' 
+                      : 'text-slate-500 hover:text-slate-300 border-transparent hover:bg-slate-800/40'
+                  }`}
+                >
+                  내 코드 (My Code)
+                </button>
+                <button
+                  onClick={() => setActiveCodeTab('answer')}
+                  className={`text-xs px-3 py-1.5 rounded-t-lg transition-colors font-medium border-b-2 ${
+                    activeCodeTab === 'answer' 
+                      ? 'bg-slate-800/80 text-emerald-400 border-emerald-500' 
+                      : 'text-slate-500 hover:text-slate-300 border-transparent hover:bg-slate-800/40'
+                  }`}
+                >
+                  정답 코드 (Answer Code)
+                </button>
               </div>
-              <div className="text-xs font-mono text-slate-400 absolute left-1/2 -translate-x-1/2">solution.py</div>
+              <div className="text-xs font-mono text-slate-500">{activeCodeTab === 'answer' ? 'answer.py' : 'solution.py'}</div>
             </div>
             <div className="flex-1 w-full relative">
               <Editor
                 height="100%"
                 language="python"
                 theme="vs-dark"
-                value={code}
+                value={activeCodeTab === 'answer' ? answerCode : myCode}
                 onChange={handleEditorChange}
                 options={{
                   minimap: { enabled: false },
