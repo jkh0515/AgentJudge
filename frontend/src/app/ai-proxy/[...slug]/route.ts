@@ -5,7 +5,8 @@ export const maxDuration = 60; // Vercel Hobby tier maximum timeout (60 seconds)
 export async function POST(req: NextRequest, { params }: { params: Promise<{ slug: string[] }> }) {
   const { slug } = await params;
   const path = slug.join('/');
-  const aiApiUrl = process.env.NEXT_PUBLIC_AI_API_URL || 'http://localhost:8000';
+  // Hardcoding the static ngrok URL to avoid any Vercel environment variable propagation issues
+  const aiApiUrl = 'https://giddiness-wildlife-unsorted.ngrok-free.dev';
   
   try {
     const contentType = req.headers.get('content-type') || 'application/json';
