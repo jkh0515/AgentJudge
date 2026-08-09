@@ -644,7 +644,7 @@ export default function JudgePage() {
       {/* Header */}
       <header className="flex justify-between items-center mb-6 glass px-6 py-4 rounded-2xl">
         <h1 className="text-2xl font-bold tracking-tight flex items-center gap-2">
-          <span className="gradient-text">Vacation</span> Judge
+          <span className="gradient-text">Agent</span>Judge
         </h1>
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-800/50 border border-slate-700">

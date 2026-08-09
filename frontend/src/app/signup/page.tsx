@@ -45,7 +45,7 @@ export default function SignupPage() {
       <div className="w-full max-w-md glass rounded-2xl p-8 flex flex-col gap-6">
         <div className="text-center">
           <h1 className="text-3xl font-bold tracking-tight mb-2 gradient-text">Create Account</h1>
-          <p className="text-slate-400">Join Vacation Judge to track your progress.</p>
+          <p className="text-slate-400">Join AgentJudge to track your progress.</p>
         </div>
 
         {error && (

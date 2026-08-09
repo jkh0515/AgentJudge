@@ -1,7 +1,11 @@
 # 🚀 AI 기반 알고리즘 악질 저지(Judge) 및 1:1 코딩 마스터 플랫폼
 
 <div align="center">
-  <h3>"Multi-Agent 자가 치유(Self-Healing) 시스템을 통한 완벽한 반례 검증 및 3대 AI 플랫폼"</h3>
+  <h3>"Multi-Agent 자가 치유(Self-Healing) 시스템을 통한 반례 검증 알고리즘 Judge 플랫폼"</h3>
+  
+  🌐 **Live Demo**: [ajent-judge.vercel.app](https://ajent-judge.vercel.app/)
+  
+  > ⚠️ **Notice**: 백엔드와 채점 샌드박스는 AWS EC2에서 24시간 가동되지만, <br> **AI 서버는 로컬 컴퓨터에서 호스팅**되고 있습니다.<br>따라서 로컬 호스트 PC가 꺼져 있을 경우 기본적인 코드 채점은 정상 작동하지만, <br> **AI 기반 기능(이미지 문제 정제, 엣지 케이스 자동 생성, AI 훈수)** 은 일시적으로 제한될 수 있습니다.
 </div>
 
 ---
@@ -52,8 +56,11 @@
 ### 3. 문제 이미지 업로드 (Image Upload)
 ![이미지 입력](image/web_image/image_input.png)
 
-### 4. OCR을 통한 텍스트 변환 (Problem Refinement)
-![OCR 텍스트 추출](image/web_image/ocr_text.png)
+### 4. OCR과 LLM을 이용한 텍스트 정제 (Problem Refinement)
+
+| 입력 사진 | OCR, LLM 텍스트 정제 결과 |
+| :---: | :---: |
+| <img src="image/test_image/input_test_image.png" width="400"> | <img src="image/web_image/ocr_text.png" width="400"> |
 
 ### 5. AI 자동 코드 생성 및 엣지 케이스 검증 (Self-Healing)
 ![코드 생성 및 검증](image/web_image/code_generate.png)

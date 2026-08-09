@@ -6,8 +6,9 @@
 venv/
 env/
 
-test_image
-test_image/*
+# Images for AI testing
+image/test_image/*
+!image/test_image/input_test_image.png
 
 # AI (dataset, models)
 ai_model

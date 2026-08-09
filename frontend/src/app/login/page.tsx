@@ -43,7 +43,7 @@ export default function LoginPage() {
     <div className="min-h-screen bg-[#0f172a] text-slate-200 flex flex-col items-center justify-center p-4">
       <div className="w-full max-w-md glass rounded-2xl p-8 flex flex-col gap-6">
         <div className="text-center">
-          <h1 className="text-3xl font-bold tracking-tight mb-2 gradient-text">Vacation Judge</h1>
+          <h1 className="text-3xl font-bold tracking-tight mb-2 gradient-text">AgentJudge</h1>
           <p className="text-slate-400">Welcome back. Please log in to your account.</p>
         </div>
 

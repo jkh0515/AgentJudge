@@ -64,7 +64,7 @@ export default function DashboardPage() {
       {/* Header */}
       <header className="flex justify-between items-center mb-6 glass px-6 py-4 rounded-2xl">
         <h1 className="text-2xl font-bold tracking-tight flex items-center gap-2 cursor-pointer" onClick={() => router.push('/')}>
-          <span className="gradient-text">Vacation</span> Judge
+          <span className="gradient-text">Agent</span>Judge
         </h1>
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-2 px-4 py-2 rounded-xl bg-slate-800/50 border border-slate-700">
