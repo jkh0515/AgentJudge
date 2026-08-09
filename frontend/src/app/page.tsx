@@ -239,7 +239,8 @@ export default function JudgePage() {
 
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${token}`
+            'Authorization': `Bearer ${token}`,
+            'ngrok-skip-browser-warning': 'true'
           },
           body: JSON.stringify({
             problem_text: problemText,
@@ -318,7 +319,8 @@ export default function JudgePage() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          'Authorization': `Bearer ${token}`,
+          'ngrok-skip-browser-warning': 'true'
         },
         body: JSON.stringify({ raw_text: problemText }),
       });
@@ -361,7 +363,8 @@ export default function JudgePage() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          'Authorization': `Bearer ${token}`,
+          'ngrok-skip-browser-warning': 'true'
         },
         body: JSON.stringify({ raw_text: rawOcrText }),
       });
@@ -412,7 +415,8 @@ export default function JudgePage() {
       const res = await fetch(`${aiApiUrl}/api/ai/ocr`, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${token}`
+          'Authorization': `Bearer ${token}`,
+          'ngrok-skip-browser-warning': 'true'
         },
         body: formData
       });
@@ -598,11 +602,14 @@ export default function JudgePage() {
     const token = localStorage.getItem('token');
     setOutput(prev => prev + '\n[🤖 AI] 분석 중... (시간이 조금 걸릴 수 있습니다)\n');
     try {
-      const response = await fetch(`/api/ai/hint`, {
+      // Use direct backend URL to bypass Next.js 30-second proxy timeout limit
+      const aiApiUrl = process.env.NEXT_PUBLIC_AI_API_URL || 'http://localhost:8000';
+      const response = await fetch(`${aiApiUrl}/api/ai/hint`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          'Authorization': `Bearer ${token}`,
+          'ngrok-skip-browser-warning': 'true'
         },
         body: JSON.stringify({
           problemText: problemText,
