@@ -604,8 +604,8 @@ export default function JudgePage() {
           'ngrok-skip-browser-warning': 'true'
         },
         body: JSON.stringify({
-          problemText: problemText,
-          failedCode: activeCodeTab === 'answer' ? answerCode : myCode,
+          problem_text: problemText,
+          failed_code: activeCodeTab === 'answer' ? answerCode : myCode,
           answer_code: answerCode,
         }),
       });
